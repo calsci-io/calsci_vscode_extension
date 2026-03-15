@@ -25,10 +25,18 @@ from typing import Any, Callable
 import serial
 from serial.tools import list_ports
 
+try:
+    import fcntl
+    import termios
+except ImportError:
+    fcntl = None
+    termios = None
+
 CALSCI_PRODUCT = "CalSci"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_RUN_TIMEOUT_SEC = 30.0
-POST_RUN_RESET_TIMEOUT_SEC = 12.0
+RUN_FAILURE_FRIENDLY_REPL_TIMEOUT_SEC = 2.5
+RUN_FAILURE_SOFT_RESET_TIMEOUT_SEC = 12.0
 RAW_REPL_CHUNK_BYTES = 256
 RAW_REPL_CHUNK_DELAY_SEC = 0.01
 RAW_REPL_ENTER_TIMEOUT_SEC = 6.0
@@ -57,6 +65,7 @@ COMMAND_PRIORITY = {
 BACKEND_WRITE_RETRIES = 3
 EVENT_SESSION = "session"
 EVENT_TERMINAL_OUTPUT = "terminal-output"
+FRIENDLY_REPL_PROMPTS = (b"CalSci >>>", b">>>")
 
 
 class ControllerError(RuntimeError):
@@ -88,6 +97,14 @@ class RawLineSink:
         self._emit(line)
 
 
+def _has_friendly_prompt(data: bytes) -> bool:
+    return any(prompt in data for prompt in FRIENDLY_REPL_PROMPTS)
+
+
+def _join_non_empty_text(parts: list[str]) -> str:
+    return "".join(part for part in parts if part)
+
+
 class CalSciController:
     def __init__(self, port: str, baudrate: int = DEFAULT_BAUDRATE, *, exclusive: bool = False):
         self.port = port
@@ -108,6 +125,7 @@ class CalSciController:
         except Exception:
             pass
         self._conn.open()
+        self._enable_kernel_exclusive_lock(exclusive)
         time.sleep(PORT_OPEN_SETTLE_SEC)
         self._in_raw_repl = False
         self._write_lock = threading.Lock()
@@ -117,6 +135,20 @@ class CalSciController:
             self._conn.close()
         except Exception:
             pass
+
+    def _enable_kernel_exclusive_lock(self, exclusive: bool) -> None:
+        if not exclusive or fcntl is None or termios is None:
+            return
+
+        ioctl_code = getattr(termios, "TIOCEXCL", None)
+        if ioctl_code is None:
+            return
+
+        try:
+            fcntl.ioctl(self._conn.fileno(), ioctl_code)
+        except OSError as exc:
+            self.close()
+            raise ControllerError(f"Could not exclusively lock port {self.port}: {exc}") from exc
 
     def write_terminal(self, data: bytes) -> None:
         if not data:
@@ -231,11 +263,16 @@ class CalSciController:
     def _raw_follow(self, timeout: float, line_callback: Callable[[str], None] | None = None) -> tuple[bytes, bytes]:
         sink = RawLineSink(line_callback) if line_callback is not None else None
 
+        def feed_stdout(chunk: bytes) -> None:
+            if sink is None or chunk == b"\x04":
+                return
+            sink.feed(chunk)
+
         normal = self._raw_read_until(
             b"\x04",
             timeout=timeout,
             timeout_overall=timeout,
-            data_consumer=sink.feed if sink is not None else None,
+            data_consumer=feed_stdout if sink is not None else None,
         )
         if not normal.endswith(b"\x04"):
             raise ControllerError("timeout waiting for raw REPL stdout terminator")
@@ -266,6 +303,37 @@ class CalSciController:
                 finally:
                     self._in_raw_repl = False
 
+    def recover_friendly_repl(self, timeout_seconds: float) -> dict[str, Any]:
+        output_chunks: list[bytes] = []
+        prompt_seen = False
+
+        self._drain_serial_input()
+        self._write_bytes(b"\x03\x03", flush=True)
+        time.sleep(SOFT_RESET_BREAK_DELAY_SEC)
+        self._write_bytes(b"\r\x02\r", flush=True)
+
+        deadline = time.monotonic() + max(0.2, timeout_seconds)
+        while time.monotonic() < deadline:
+            chunk = self.read_terminal_chunk()
+            if not chunk:
+                time.sleep(0.05)
+                continue
+            output_chunks.append(chunk)
+            if _has_friendly_prompt(b"".join(output_chunks[-8:])):
+                prompt_seen = True
+                break
+
+        output = b"".join(output_chunks).decode("utf-8", errors="replace")
+        payload = {
+            "ok": prompt_seen,
+            "promptSeen": prompt_seen,
+            "port": self.port,
+            "output": output,
+        }
+        if not prompt_seen:
+            payload["error"] = "Friendly REPL prompt not detected after run recovery."
+        return payload
+
     def soft_reset(self, timeout_seconds: float) -> dict[str, Any]:
         output_chunks: list[bytes] = []
         prompt_seen = False
@@ -282,7 +350,7 @@ class CalSciController:
                 merged = b"".join(output_chunks[-8:])
                 if any(marker in merged for marker in SOFT_RESET_REBOOT_MARKERS):
                     reboot_seen = True
-                if b"CalSci >>>" in merged or b">>>" in merged:
+                if _has_friendly_prompt(merged):
                     prompt_seen = True
                     reboot_seen = True
                     return
@@ -464,7 +532,7 @@ class PersistentSession:
             }
 
         payload: dict[str, Any]
-        restore_payload: dict[str, Any]
+        recovery_payload: dict[str, Any] | None = None
         try:
             try:
                 stdout_bytes, stderr_bytes = controller.exec_source(
@@ -501,38 +569,28 @@ class PersistentSession:
                     "output": "",
                     "error": str(exc),
                 }
-
-            try:
-                restore_payload = controller.soft_reset(POST_RUN_RESET_TIMEOUT_SEC)
-            except Exception as exc:
-                restore_payload = {
-                    "ok": False,
-                    "promptSeen": False,
-                    "rebootSeen": False,
-                    "port": controller.port,
-                    "output": "",
-                    "error": str(exc),
-                }
+                recovery_payload = _recover_after_run_failure(controller)
         finally:
             self._end_exclusive_operation(pause_requested)
 
-        if restore_payload.get("output"):
-            self._emit_terminal_text(str(restore_payload["output"]))
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
 
-        if not restore_payload.get("ok"):
+        if recovery_payload and not recovery_payload.get("ok"):
             payload["ok"] = False
             existing_error = payload.get("error")
-            restore_error = restore_payload.get("error") or "Failed to restore calculator runtime after run"
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after run"
             if existing_error:
                 payload["error"] = f"{existing_error} | restore failed: {restore_error}"
             else:
                 payload["error"] = f"restore failed: {restore_error}"
 
-        payload["restoreDetail"] = {
-            "ok": bool(restore_payload.get("ok")),
-            "port": payload.get("port", port or ""),
-            "softReset": restore_payload,
-        }
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
         return payload
 
     def _attach_session_locked(self, controller: CalSciController) -> None:
@@ -612,7 +670,9 @@ class PersistentSession:
 
                 try:
                     chunk = controller.read_terminal_chunk()
-                except (serial.SerialException, serial.SerialTimeoutException, OSError) as exc:
+                except (serial.SerialException, serial.SerialTimeoutException, OSError, TypeError) as exc:
+                    if stop_event.is_set():
+                        return
                     self._handle_reader_failure(controller, str(exc))
                     return
 
@@ -793,6 +853,68 @@ def _optional_arg_string(args: dict[str, Any], key: str) -> str | None:
     return text or None
 
 
+def _recover_after_run_failure(controller: CalSciController) -> dict[str, Any]:
+    try:
+        friendly_repl = controller.recover_friendly_repl(RUN_FAILURE_FRIENDLY_REPL_TIMEOUT_SEC)
+    except Exception as exc:
+        friendly_repl = {
+            "ok": False,
+            "promptSeen": False,
+            "port": controller.port,
+            "output": "",
+            "error": str(exc),
+        }
+
+    if friendly_repl.get("ok"):
+        return {
+            "ok": True,
+            "mode": "friendly-repl",
+            "port": controller.port,
+            "output": friendly_repl.get("output", ""),
+            "friendlyRepl": friendly_repl,
+        }
+
+    try:
+        soft_reset = controller.soft_reset(RUN_FAILURE_SOFT_RESET_TIMEOUT_SEC)
+    except Exception as exc:
+        soft_reset = {
+            "ok": False,
+            "promptSeen": False,
+            "rebootSeen": False,
+            "port": controller.port,
+            "output": "",
+            "error": str(exc),
+        }
+
+    if soft_reset.get("ok"):
+        return {
+            "ok": True,
+            "mode": "soft-reset",
+            "port": controller.port,
+            "output": _join_non_empty_text([
+                str(friendly_repl.get("output", "")),
+                str(soft_reset.get("output", "")),
+            ]),
+            "friendlyRepl": friendly_repl,
+            "softReset": soft_reset,
+        }
+
+    return {
+        "ok": False,
+        "mode": "failed",
+        "port": controller.port,
+        "output": _join_non_empty_text([
+            str(friendly_repl.get("output", "")),
+            str(soft_reset.get("output", "")),
+        ]),
+        "friendlyRepl": friendly_repl,
+        "softReset": soft_reset,
+        "error": soft_reset.get("error")
+        or friendly_repl.get("error")
+        or "Failed to recover friendly REPL after run.",
+    }
+
+
 def list_calsci_ports() -> list[dict[str, str]]:
     devices: list[dict[str, str]] = []
     for port in list_ports.comports():
@@ -859,6 +981,7 @@ def run_file(
 
     controller = CalSciController(port, exclusive=False)
     payload: dict[str, Any]
+    recovery_payload: dict[str, Any] | None = None
     try:
         stdout_bytes, stderr_bytes = controller.exec_source(
             source,
@@ -894,34 +1017,24 @@ def run_file(
             "output": "",
             "error": str(exc),
         }
-
-    try:
-        restore_payload = controller.soft_reset(POST_RUN_RESET_TIMEOUT_SEC)
-    except Exception as exc:
-        restore_payload = {
-            "ok": False,
-            "promptSeen": False,
-            "rebootSeen": False,
-            "port": port,
-            "output": "",
-            "error": str(exc),
-        }
+        recovery_payload = _recover_after_run_failure(controller)
     finally:
         controller.close()
 
-    if not restore_payload.get("ok"):
+    if recovery_payload and not recovery_payload.get("ok"):
         payload["ok"] = False
         existing_error = payload.get("error")
-        restore_error = restore_payload.get("error") or "Failed to restore calculator runtime after run"
+        restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after run"
         if existing_error:
             payload["error"] = f"{existing_error} | restore failed: {restore_error}"
         else:
             payload["error"] = f"restore failed: {restore_error}"
-    payload["restoreDetail"] = {
-        "ok": bool(restore_payload.get("ok")),
-        "port": port,
-        "softReset": restore_payload,
-    }
+    if recovery_payload is not None:
+        payload["restoreDetail"] = {
+            "ok": bool(recovery_payload.get("ok")),
+            "port": port,
+            "recovery": recovery_payload,
+        }
     return payload
 
 
