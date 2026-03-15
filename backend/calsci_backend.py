@@ -40,10 +40,10 @@ RUN_FAILURE_SOFT_RESET_TIMEOUT_SEC = 12.0
 RAW_REPL_CHUNK_BYTES = 256
 RAW_REPL_CHUNK_DELAY_SEC = 0.01
 RAW_REPL_ENTER_TIMEOUT_SEC = 6.0
+RAW_REPL_EXIT_TIMEOUT_SEC = 2.0
 RAW_REPL_BANNER = b"raw REPL; CTRL-B to exit\r\n"
 RAW_REPL_PROMPT = RAW_REPL_BANNER + b">"
 PORT_OPEN_SETTLE_SEC = 0.12
-LINE_FLUSH_DELAY_SEC = 0.03
 READER_PAUSE_WAIT_SEC = 0.5
 SOFT_RESET_BREAK_DELAY_SEC = 0.05
 SOFT_RESET_TIMEOUT_FALLBACK_SEC = 2.5
@@ -245,7 +245,9 @@ class CalSciController:
 
     def _exit_raw_repl(self) -> None:
         self._write_bytes(b"\r\x02", flush=True)
-        time.sleep(LINE_FLUSH_DELAY_SEC)
+        prompt_seen, _ = self._read_until_friendly_prompt(RAW_REPL_EXIT_TIMEOUT_SEC)
+        if not prompt_seen:
+            raise ControllerError("friendly REPL prompt missing after leaving raw REPL")
         self._in_raw_repl = False
 
     def _exec_raw_no_follow(self, source: str | bytes) -> None:
@@ -284,7 +286,26 @@ class CalSciController:
         if not error.endswith(b"\x04"):
             raise ControllerError("timeout waiting for raw REPL stderr terminator")
         error = error[:-1]
+
+        prompt = self._raw_read_until(b">", timeout=0.5, timeout_overall=1.0)
+        if not prompt.endswith(b">"):
+            raise ControllerError("raw REPL prompt missing after command")
         return normal, error
+
+    def _read_until_friendly_prompt(self, timeout_seconds: float) -> tuple[bool, bytes]:
+        output_chunks: list[bytes] = []
+        deadline = time.monotonic() + max(0.2, timeout_seconds)
+
+        while time.monotonic() < deadline:
+            chunk = self.read_terminal_chunk()
+            if not chunk:
+                time.sleep(0.05)
+                continue
+            output_chunks.append(chunk)
+            if _has_friendly_prompt(b"".join(output_chunks[-8:])):
+                return True, b"".join(output_chunks)
+
+        return False, b"".join(output_chunks)
 
     def exec_source(
         self,
@@ -304,26 +325,12 @@ class CalSciController:
                     self._in_raw_repl = False
 
     def recover_friendly_repl(self, timeout_seconds: float) -> dict[str, Any]:
-        output_chunks: list[bytes] = []
-        prompt_seen = False
-
         self._drain_serial_input()
         self._write_bytes(b"\x03\x03", flush=True)
         time.sleep(SOFT_RESET_BREAK_DELAY_SEC)
         self._write_bytes(b"\r\x02\r", flush=True)
-
-        deadline = time.monotonic() + max(0.2, timeout_seconds)
-        while time.monotonic() < deadline:
-            chunk = self.read_terminal_chunk()
-            if not chunk:
-                time.sleep(0.05)
-                continue
-            output_chunks.append(chunk)
-            if _has_friendly_prompt(b"".join(output_chunks[-8:])):
-                prompt_seen = True
-                break
-
-        output = b"".join(output_chunks).decode("utf-8", errors="replace")
+        prompt_seen, output_bytes = self._read_until_friendly_prompt(timeout_seconds)
+        output = output_bytes.decode("utf-8", errors="replace")
         payload = {
             "ok": prompt_seen,
             "promptSeen": prompt_seen,
