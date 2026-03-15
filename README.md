@@ -25,7 +25,7 @@ CalSci Step 1 extension for the desktop-to-extension migration.
 ## Settings
 
 - `calsci.resetTimeoutSeconds` default `5`
-- `calsci.runTimeoutSeconds` default `30`
+- `calsci.runTimeoutSeconds` default `300`
 
 ## Development
 

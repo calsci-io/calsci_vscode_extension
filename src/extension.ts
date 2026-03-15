@@ -912,7 +912,7 @@ class CalSciExtensionController implements vscode.Disposable {
         return;
       }
 
-      const timeout = vscode.workspace.getConfiguration("calsci").get<number>("runTimeoutSeconds", 30);
+      const timeout = vscode.workspace.getConfiguration("calsci").get<number>("runTimeoutSeconds", 300);
       let result: RunFileResult;
 
       try {
@@ -929,6 +929,7 @@ class CalSciExtensionController implements vscode.Disposable {
             this.runOutput.appendLine(`CalSci run on ${port}`);
             this.runOutput.appendLine(`File: ${localFile}`);
             this.runOutput.appendLine("");
+            this.runOutput.show(false);
 
             const pendingLines: string[] = [];
             let flushTimer: NodeJS.Timeout | undefined;
@@ -972,7 +973,7 @@ class CalSciExtensionController implements vscode.Disposable {
       }
 
       await this.pollDevices();
-      this.runOutput.show(true);
+      this.runOutput.show(false);
 
       if (!result.ok) {
         const detail = result.error ? ` ${result.error}` : "";

@@ -34,7 +34,7 @@ except ImportError:
 
 CALSCI_PRODUCT = "CalSci"
 DEFAULT_BAUDRATE = 115200
-DEFAULT_RUN_TIMEOUT_SEC = 30.0
+DEFAULT_RUN_TIMEOUT_SEC = 300
 RUN_FAILURE_FRIENDLY_REPL_TIMEOUT_SEC = 2.5
 RUN_FAILURE_SOFT_RESET_TIMEOUT_SEC = 12.0
 RAW_REPL_CHUNK_BYTES = 256
@@ -277,14 +277,14 @@ class CalSciController:
             data_consumer=feed_stdout if sink is not None else None,
         )
         if not normal.endswith(b"\x04"):
-            raise ControllerError("timeout waiting for raw REPL stdout terminator")
+            raise ControllerError(f"run timed out after {timeout:g}s waiting for raw REPL stdout terminator")
         normal = normal[:-1]
         if sink is not None:
             sink.flush()
 
         error = self._raw_read_until(b"\x04", timeout=timeout, timeout_overall=timeout)
         if not error.endswith(b"\x04"):
-            raise ControllerError("timeout waiting for raw REPL stderr terminator")
+            raise ControllerError(f"run timed out after {timeout:g}s waiting for raw REPL stderr terminator")
         error = error[:-1]
 
         prompt = self._raw_read_until(b">", timeout=0.5, timeout_overall=1.0)
@@ -313,16 +313,22 @@ class CalSciController:
         timeout_seconds: float,
         line_callback: Callable[[str], None] | None = None,
     ) -> tuple[bytes, bytes]:
+        self._enter_raw_repl()
         try:
-            self._enter_raw_repl()
             self._exec_raw_no_follow(source)
-            return self._raw_follow(timeout_seconds, line_callback=line_callback)
+            output = self._raw_follow(timeout_seconds, line_callback=line_callback)
+        except Exception:
+            # On command failure or timeout the device may still be running user code,
+            # so raw->friendly recovery is handled by the outer recovery path.
+            self._in_raw_repl = False
+            raise
+
+        try:
+            self._exit_raw_repl()
         finally:
-            if self._in_raw_repl:
-                try:
-                    self._exit_raw_repl()
-                finally:
-                    self._in_raw_repl = False
+            self._in_raw_repl = False
+
+        return output
 
     def recover_friendly_repl(self, timeout_seconds: float) -> dict[str, Any]:
         self._drain_serial_input()
