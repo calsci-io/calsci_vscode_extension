@@ -1,6 +1,6 @@
 # CalSci VS Code Extension
 
-CalSci Step 1 extension for the desktop-to-extension migration.
+CalSci extension for the desktop-to-extension migration. Step 1 is achieved, and the Step 2 helper-path hybrid panel is now implemented in the extension pending live verification. Phased status is tracked in [MIGRATION.md](./MIGRATION.md).
 
 ## Current scope
 
@@ -10,7 +10,7 @@ CalSci Step 1 extension for the desktop-to-extension migration.
   - `CalSci: Select Device`
   - `CalSci: Soft Reset Device`
   - `CalSci: Run Current File`
-- No hybrid mirror or keypad yet.
+- `CalSci: Open Hybrid Panel` for helper-path display mirroring and keypad injection.
 
 ## Behavior
 
@@ -20,12 +20,13 @@ CalSci Step 1 extension for the desktop-to-extension migration.
 - `Run Current File` uses raw REPL on the existing session and returns to the friendly REPL without resetting on success.
 - If a run leaves the session in a bad state, backend recovery first tries to restore the friendly REPL and only falls back to a soft reset as a last resort.
 - `Soft Reset Device` reuses the same held session.
+- `Open Hybrid Panel` reuses the same held session and talks to the current helper contract (`_hyb_mode`, `_hyb_poll_state`, `_hyb_sync_full`, `_hyb_key`) through the backend.
 - External terminals should not be able to claim the same port while the extension session is active.
 
 ## Settings
 
 - `calsci.resetTimeoutSeconds` default `5`
-- `calsci.runTimeoutSeconds` default `300`
+- `calsci.runTimeoutSeconds` default `0` (`0` disables timeout)
 
 ## Development
 

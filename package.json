@@ -15,7 +15,8 @@
     "onStartupFinished",
     "onCommand:calsci.softResetDevice",
     "onCommand:calsci.selectDevice",
-    "onCommand:calsci.runCurrentFile"
+    "onCommand:calsci.runCurrentFile",
+    "onCommand:calsci.openHybridPanel"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -31,6 +32,10 @@
       {
         "command": "calsci.runCurrentFile",
         "title": "CalSci: Run Current File"
+      },
+      {
+        "command": "calsci.openHybridPanel",
+        "title": "CalSci: Open Hybrid Panel"
       }
     ],
     "configuration": {
@@ -45,10 +50,10 @@
         },
         "calsci.runTimeoutSeconds": {
           "type": "number",
-          "default": 300,
-          "minimum": 1,
+          "default": 0,
+          "minimum": 0,
           "maximum": 600,
-          "description": "Timeout for running active Python file on CalSci."
+          "description": "Timeout for running active Python file on CalSci. Set to 0 to disable the timeout."
         }
       }
     }
