@@ -1,0 +1,65 @@
+{
+  "name": "calsci-vscode-extension",
+  "displayName": "CalSci",
+  "description": "CalSci device extension with a persistent backend-owned REPL session.",
+  "version": "0.0.1",
+  "publisher": "calsci",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:calsci.softResetDevice",
+    "onCommand:calsci.selectDevice",
+    "onCommand:calsci.runCurrentFile"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "calsci.softResetDevice",
+        "title": "CalSci: Soft Reset Device"
+      },
+      {
+        "command": "calsci.selectDevice",
+        "title": "CalSci: Select Device"
+      },
+      {
+        "command": "calsci.runCurrentFile",
+        "title": "CalSci: Run Current File"
+      }
+    ],
+    "configuration": {
+      "title": "CalSci",
+      "properties": {
+        "calsci.resetTimeoutSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 60,
+          "description": "Timeout for waiting CalSci prompt after soft reset."
+        },
+        "calsci.runTimeoutSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 600,
+          "description": "Timeout for running active Python file on CalSci."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.6.3"
+  }
+}
