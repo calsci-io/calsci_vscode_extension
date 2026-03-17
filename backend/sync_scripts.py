@@ -274,6 +274,112 @@ def device_selected_file_sizes_stream_script(remote_paths: list[str]) -> str:
     )
 
 
+def device_scan_tree_stream_script(remote_root: str) -> str:
+    remote_root_json = json.dumps(remote_root)
+    return (
+        "import os, sys\n"
+        f"_root = {remote_root_json}\n"
+        "def _is_dir(_entry, _full, _stat):\n"
+        "    try:\n"
+        "        if len(_entry) > 1 and isinstance(_entry[1], int) and (_entry[1] & 0x4000):\n"
+        "            return True\n"
+        "    except:\n"
+        "        pass\n"
+        "    try:\n"
+        "        _mode = _stat[0] if _stat and len(_stat) > 0 else 0\n"
+        "        if _mode & 0x4000:\n"
+        "            return True\n"
+        "    except:\n"
+        "        pass\n"
+        "    try:\n"
+        "        os.ilistdir(_full)\n"
+        "        return True\n"
+        "    except:\n"
+        "        return False\n"
+        "def _emit_dir(_path):\n"
+        "    sys.stdout.write('DIR:' + str(len(_path)) + ':' + _path + '\\n')\n"
+        "def _emit_file(_path, _size):\n"
+        "    sys.stdout.write('FILE:' + str(len(_path)) + ':' + _path + ':' + str(_size) + '\\n')\n"
+        "def _scan(_path):\n"
+        "    try:\n"
+        "        for _entry in os.ilistdir(_path):\n"
+        "            _name = _entry[0]\n"
+        "            _full = _path + '/' + _name if _path != '/' else '/' + _name\n"
+        "            _stat = None\n"
+        "            try:\n"
+        "                _stat = os.stat(_full)\n"
+        "            except:\n"
+        "                _stat = None\n"
+        "            try:\n"
+        "                if _is_dir(_entry, _full, _stat):\n"
+        "                    _emit_dir(_full)\n"
+        "                    _scan(_full)\n"
+        "                else:\n"
+        "                    if _stat is not None and len(_stat) > 6:\n"
+        "                        _size = _stat[6]\n"
+        "                    elif len(_entry) > 3 and isinstance(_entry[3], int):\n"
+        "                        _size = _entry[3]\n"
+        "                    else:\n"
+        "                        _size = 0\n"
+        "                    _emit_file(_full, _size)\n"
+        "            except Exception as _inner_exc:\n"
+        "                sys.stdout.write('SCANERR:' + _full + ':' + str(_inner_exc) + '\\n')\n"
+        "    except Exception as _exc:\n"
+        "        sys.stdout.write('SCANERR:' + _path + ':' + str(_exc) + '\\n')\n"
+        "_scan(_root)\n"
+        "print('TREE_SCAN_DONE')\n"
+    )
+
+
+def device_read_file_hex_stream_script(remote_file: str, chunk_bytes: int) -> str:
+    remote_file_json = json.dumps(remote_file)
+    return (
+        "import sys\n"
+        "try:\n"
+        "    import ubinascii as _binascii\n"
+        "except ImportError:\n"
+        "    import binascii as _binascii\n"
+        f"_path = {remote_file_json}\n"
+        "try:\n"
+        "    _f = open(_path, 'rb')\n"
+        "    try:\n"
+        f"        while True:\n"
+        f"            _chunk = _f.read({int(chunk_bytes)})\n"
+        "            if not _chunk:\n"
+        "                break\n"
+        "            sys.stdout.write('HEX:' + _binascii.hexlify(_chunk).decode() + '\\n')\n"
+        "    finally:\n"
+        "        _f.close()\n"
+        "    print('FILE_READ_DONE')\n"
+        "except Exception as _exc:\n"
+        "    print('FILE_READ_ERR:' + str(_exc))\n"
+    )
+
+
+def device_read_text_file_stream_script(remote_file: str, chunk_chars: int) -> str:
+    remote_file_json = json.dumps(remote_file)
+    return (
+        "import sys\n"
+        f"_path = {remote_file_json}\n"
+        "_start = '[[CALSCI_FILE_CONTENT_START]]'\n"
+        "_end = '[[CALSCI_FILE_CONTENT_END]]'\n"
+        "try:\n"
+        "    _f = open(_path, 'r')\n"
+        "    try:\n"
+        "        print(_start)\n"
+        f"        while True:\n"
+        f"            _chunk = _f.read({int(chunk_chars)})\n"
+        "            if not _chunk:\n"
+        "                break\n"
+        "            sys.stdout.write(_chunk)\n"
+        "        print(_end)\n"
+        "    finally:\n"
+        "        _f.close()\n"
+        "except Exception as _exc:\n"
+        "    print('FILE_READ_ERR:' + str(_exc))\n"
+    )
+
+
 def device_put_file_script(remote_file: str, data: bytes, chunk_bytes: int) -> str:
     remote_file_json = json.dumps(remote_file)
     lines = [

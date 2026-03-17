@@ -1,5 +1,6 @@
 export const SELECTED_PORT_KEY = "selectedPort";
 export const SYNC_FOLDER_HISTORY_KEY = "syncFolderHistory";
+export const FIRMWARE_FLASH_PATHS_KEY = "firmwareFlashPaths";
 export const POLL_INTERVAL_MS = 1000;
 export const BACKEND_TIMEOUT_BUFFER_SEC = 30;
 export const SESSION_RETRY_BACKOFF_MS = 3000;
@@ -56,10 +57,56 @@ export type SyncFolderResult = {
   error?: string;
 };
 
+export type WorkspaceImportResult = {
+  ok: boolean;
+  port: string;
+  localFolder: string;
+  filesImported?: number;
+  directoriesImported?: number;
+  bytesImported?: number;
+  error?: string;
+};
+
+export type WorkspaceTreeEntry = {
+  path: string;
+  kind: "directory" | "file";
+  size?: number;
+};
+
+export type WorkspaceTreeResult = {
+  ok: boolean;
+  port: string;
+  entries?: WorkspaceTreeEntry[];
+  error?: string;
+};
+
+export type WorkspaceFileResult = {
+  ok: boolean;
+  port: string;
+  remotePath: string;
+  content?: string;
+  error?: string;
+};
+
 export type SyncFolderSelection = {
   localFolder: string;
   remoteFolder: string;
   deleteExtraneous: boolean;
+};
+
+export type FirmwareFlashPaths = {
+  bootloaderPath: string;
+  calOsPath: string;
+  partitionTablePath: string;
+};
+
+export type FirmwareFlashResult = {
+  ok: boolean;
+  port: string;
+  bootloaderPath: string;
+  calOsPath: string;
+  partitionTablePath: string;
+  error?: string;
 };
 
 export type RunCancelResult = {

@@ -1,0 +1,6 @@
+    {
+        "name": "battery_status",
+        "folder": "settings",
+        "visibility": true
+    }
+]

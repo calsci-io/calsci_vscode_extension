@@ -15,11 +15,13 @@ from __future__ import annotations
 import argparse
 import ast
 import codecs
+import importlib.util
 import json
 import os
 import posixpath
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -92,6 +94,21 @@ SYNC_TARGETED_SCAN_BATCH_SIZE = 64
 SYNC_TARGETED_SCAN_MAX_SCRIPT_CHARS = 2600
 SYNC_TARGETED_VERIFY_MAX_FILES = 64
 SYNC_TARGETED_VERIFY_TIMEOUT_SEC = 8.0
+WORKSPACE_IMPORT_FILE_CHUNK_BYTES = 128
+WORKSPACE_READ_TEXT_CHUNK_CHARS = 256
+WORKSPACE_IMPORT_FILE_TIMEOUT_MAX_SEC = 90.0
+WORKSPACE_IMPORT_FILE_THROUGHPUT_BYTES_PER_SEC = 4096.0
+FIRMWARE_FLASH_CHIP = "esp32s3"
+FIRMWARE_FLASH_BAUDRATE = 115200
+FIRMWARE_FLASH_CONNECT_ATTEMPTS = 10
+FIRMWARE_FLASH_BEFORE = "usb-reset"
+FIRMWARE_FLASH_AFTER = "hard-reset"
+FIRMWARE_FLASH_BOOTLOADER_OFFSET = "0x0"
+FIRMWARE_FLASH_PARTITION_OFFSET = "0x8000"
+FIRMWARE_FLASH_CALOS_OFFSET = "0x10000"
+FIRMWARE_FLASH_PORT_RESCAN_TIMEOUT_SEC = 12.0
+FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC = 0.5
+ESP32_KEYWORDS = ("Espressif", CALSCI_PRODUCT)
 SOFT_RESET_REBOOT_MARKERS = (
     b"soft reboot",
     b"CalSci - Triple Boot System",
@@ -105,8 +122,12 @@ COMMAND_PRIORITY = {
     "run-file-interactive": 9,
     "run-file": 10,
     "sync-folder": 11,
+    "workspace.scan-tree": 11,
+    "workspace.read-file": 11,
+    "workspace.import": 11,
     "hybrid.start": 11,
     "hybrid.stop": 12,
+    "firmware.flash": 15,
     "soft-reset": 20,
     "session.close": 25,
     "session.state": 30,
@@ -229,6 +250,26 @@ def _unwrap_helper_frame(text: str) -> str | None:
     return text[len(HELPER_FRAME_PREFIX) : -len(HELPER_FRAME_SUFFIX)]
 
 
+def _split_helper_framed_text(text: str) -> tuple[str, list[str], str]:
+    visible_parts: list[str] = []
+    frames: list[str] = []
+    scan = 0
+
+    while True:
+        start = text.find(HELPER_FRAME_PREFIX, scan)
+        if start < 0:
+            visible_parts.append(text[scan:])
+            return "".join(visible_parts), frames, ""
+
+        visible_parts.append(text[scan:start])
+        end = text.find(HELPER_FRAME_SUFFIX, start + len(HELPER_FRAME_PREFIX))
+        if end < 0:
+            return "".join(visible_parts), frames, text[start:]
+
+        frames.append(text[start + len(HELPER_FRAME_PREFIX) : end])
+        scan = end + len(HELPER_FRAME_SUFFIX)
+
+
 def _clean_helper_line(line: str) -> str:
     cleaned = line.replace("\r", "").strip()
     cleaned = _strip_repl_prompt_prefix(cleaned)
@@ -242,7 +283,19 @@ def _parse_helper_output(text: str, command: str | None = None) -> dict[str, Any
     states: list[dict[str, Any]] = []
     lines: list[str] = []
     command_text = (command or "").strip()
-    for raw_line in text.replace("\r", "\n").split("\n"):
+    normalized = text.replace("\r", "\n")
+    visible_text, framed_payloads, _ = _split_helper_framed_text(normalized)
+
+    for framed in framed_payloads:
+        cleaned = _strip_repl_prompt_prefix(framed.replace("\r", "").strip()).strip()
+        if not cleaned:
+            continue
+        if command_text and cleaned == command_text:
+            continue
+        lines.append(cleaned)
+        states.extend(_extract_state_payloads(cleaned))
+
+    for raw_line in visible_text.split("\n"):
         cleaned = _clean_helper_line(raw_line)
         if not cleaned:
             continue
@@ -955,6 +1008,108 @@ class CalSciController:
                 stream_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
             return _parse_device_selected_sizes_stream_output(stream_raw)
 
+    def sync_scan_tree(
+        self,
+        remote_root: str,
+        timeout: float = SYNC_SCAN_COMMAND_TIMEOUT_SEC,
+    ) -> tuple[list[str], dict[str, int]]:
+        stream_code = _device_scan_tree_stream_script(remote_root)
+        raw = ""
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_tree_stream_output(friendly_raw)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly tree scan failed: {friendly_exc}"
+                ) from friendly_exc
+
+        return _parse_device_tree_stream_output(raw)
+
+    def sync_read_file_bytes(
+        self,
+        remote_path: str,
+        timeout: float,
+    ) -> bytes:
+        stream_code = _device_read_file_hex_stream_script(
+            remote_path,
+            chunk_bytes=WORKSPACE_IMPORT_FILE_CHUNK_BYTES,
+        )
+        raw = ""
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_file_hex_output(friendly_raw, remote_path=remote_path)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly file read failed for {remote_path}: {friendly_exc}"
+                ) from friendly_exc
+
+        return _parse_device_file_hex_output(raw, remote_path=remote_path)
+
+    def sync_read_file_text(
+        self,
+        remote_path: str,
+        timeout: float,
+    ) -> str:
+        stream_code = _device_read_text_file_stream_script(
+            remote_path,
+            chunk_chars=WORKSPACE_READ_TEXT_CHUNK_CHARS,
+        )
+        raw = ""
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_text_file_output(friendly_raw, remote_path=remote_path)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly file read failed for {remote_path}: {friendly_exc}"
+                ) from friendly_exc
+
+        return _parse_device_text_file_output(raw, remote_path=remote_path)
+
     def sync_mkdir(self, path: str) -> bool:
         target = json.dumps(path)
         code = (
@@ -1147,6 +1302,7 @@ class PersistentSession:
         self._hybrid_poll_sent_at = 0.0
         self._helper_condition = threading.Condition()
         self._helper_line_buffer = ""
+        self._helper_frame_remainder = ""
         self._helper_lines: deque[tuple[int, str]] = deque(maxlen=256)
         self._helper_line_seq = 0
         self._helper_state_seq = 0
@@ -1985,6 +2141,282 @@ class PersistentSession:
 
         return payload
 
+    def workspace_scan_tree(self, port: str | None) -> dict[str, Any]:
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "entries": [],
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "entries": [],
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                remote_dirs, remote_files = controller.sync_scan_tree("/", timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC)
+                entries = [
+                    {"path": remote_dir, "kind": "directory"}
+                    for remote_dir in remote_dirs
+                ]
+                entries.extend(
+                    {
+                        "path": remote_path,
+                        "kind": "file",
+                        "size": int(file_size),
+                    }
+                    for remote_path, file_size in sorted(remote_files.items())
+                )
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "entries": entries,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "entries": [],
+                    "error": str(exc),
+                }
+                recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after workspace scan"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def workspace_read_file(self, port: str | None, remote_path: str) -> dict[str, Any]:
+        normalized_remote_path = _sync_device_absolute_path(remote_path)
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "remotePath": normalized_remote_path,
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "remotePath": normalized_remote_path,
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                content_text = controller.sync_read_file_text(
+                    normalized_remote_path,
+                    timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC,
+                )
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "content": content_text,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "error": str(exc),
+                }
+                recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after file read"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def import_workspace(
+        self,
+        port: str | None,
+        local_folder: str,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        local_root = Path(local_folder).expanduser().resolve()
+        if local_root.exists() and not local_root.is_dir():
+            return {
+                "ok": False,
+                "port": port or "",
+                "localFolder": str(local_root),
+                "error": f"Workspace import target is not a directory: {local_root}",
+            }
+
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "localFolder": str(local_root),
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        def report(line: str) -> None:
+            if progress_callback is not None:
+                progress_callback(line)
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "localFolder": str(local_root),
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                local_root.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    enter_raw = getattr(controller, "_enter_raw_repl", None)
+                    if callable(enter_raw):
+                        enter_raw(timeout_overall=RAW_REPL_ENTER_TIMEOUT_SEC)
+                except Exception:
+                    pass
+
+                report("Scanning CalSci workspace…")
+                remote_dirs, remote_files = controller.sync_scan_tree("/", timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC)
+                report(f"Found {len(remote_files)} file(s) and {len(remote_dirs)} folder(s)")
+
+                ensured_dirs = 0
+                for remote_dir in remote_dirs:
+                    relative_dir = _sync_device_relative_path(remote_dir)
+                    if not relative_dir:
+                        continue
+                    (local_root / Path(relative_dir)).mkdir(parents=True, exist_ok=True)
+                    ensured_dirs += 1
+
+                bytes_imported = 0
+                imported_files = 0
+                sorted_files = sorted(remote_files.items())
+                for index, (remote_path, file_size) in enumerate(sorted_files, start=1):
+                    relative_file = _sync_device_relative_path(remote_path)
+                    local_path = local_root / Path(relative_file)
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    timeout = min(
+                        WORKSPACE_IMPORT_FILE_TIMEOUT_MAX_SEC,
+                        max(5.0, 2.0 + (max(0, int(file_size)) / WORKSPACE_IMPORT_FILE_THROUGHPUT_BYTES_PER_SEC)),
+                    )
+                    content = controller.sync_read_file_bytes(remote_path, timeout=timeout)
+                    local_path.write_bytes(content)
+                    imported_files += 1
+                    bytes_imported += len(content)
+                    report(f"[{index}/{len(sorted_files)}] Imported: {remote_path}")
+
+                report(
+                    f"Workspace import complete: {imported_files} file(s), "
+                    f"{ensured_dirs} folder(s), {bytes_imported} bytes"
+                )
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "localFolder": str(local_root),
+                    "filesImported": imported_files,
+                    "directoriesImported": ensured_dirs,
+                    "bytesImported": bytes_imported,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "localFolder": str(local_root),
+                    "error": str(exc),
+                }
+                recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                try:
+                    if bool(getattr(controller, "_in_raw_repl", False)):
+                        exit_raw = getattr(controller, "sync_exit_raw_repl", None)
+                        if callable(exit_raw):
+                            exit_raw()
+                except Exception:
+                    pass
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after workspace import"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
     def hybrid_snapshot(self) -> dict[str, Any]:
         with self._hybrid_lock:
             return {
@@ -2283,6 +2715,8 @@ class PersistentSession:
             if suppress_helper_output and time.monotonic() >= self._suppress_terminal_helper_output_deadline:
                 if _looks_like_helper_terminal_fragment(self._helper_line_buffer):
                     self._helper_line_buffer = ""
+                if _looks_like_helper_terminal_fragment(self._helper_frame_remainder):
+                    self._helper_frame_remainder = ""
                 self._suppress_terminal_helper_output = False
                 self._suppress_terminal_helper_depth = 0
                 self._suppress_terminal_helper_output_deadline = 0.0
@@ -2290,7 +2724,24 @@ class PersistentSession:
                 suppress_helper_output = False
             started_suppressed = suppress_helper_output
 
-            self._helper_line_buffer += normalized
+            stream_text = self._helper_frame_remainder + normalized
+            visible_text, framed_payloads, frame_remainder = _split_helper_framed_text(stream_text)
+            self._helper_frame_remainder = frame_remainder
+
+            for framed in framed_payloads:
+                cleaned = _strip_repl_prompt_prefix(framed.replace("\r", "").strip()).strip()
+                if not cleaned:
+                    continue
+                self._helper_line_seq += 1
+                self._helper_lines.append((self._helper_line_seq, cleaned))
+                status_payloads, state_payloads = self._process_helper_line_locked(cleaned)
+                status_events.extend(status_payloads)
+                state_events.extend(state_payloads)
+                if suppress_helper_output or started_suppressed:
+                    helper_activity_seen = True
+                    self._suppress_terminal_helper_activity_seen = True
+
+            self._helper_line_buffer += visible_text
             while True:
                 newline = self._helper_line_buffer.find("\n")
                 if newline < 0:
@@ -2590,6 +3041,7 @@ class PersistentSession:
         self._reader_thread = thread
         with self._helper_condition:
             self._helper_line_buffer = ""
+            self._helper_frame_remainder = ""
             self._helper_lines.clear()
             self._helper_line_seq = 0
             self._helper_state_seq = 0
@@ -2902,6 +3354,38 @@ class JobDispatcher:
                         )
                     ) if job.stream else None,
                 )
+            if job.command == "workspace.scan-tree":
+                return self._session.workspace_scan_tree(
+                    port=_optional_arg_string(args, "port"),
+                )
+            if job.command == "workspace.read-file":
+                return self._session.workspace_read_file(
+                    port=_optional_arg_string(args, "port"),
+                    remote_path=str(args["remotePath"]),
+                )
+            if job.command == "workspace.import":
+                return self._session.import_workspace(
+                    port=_optional_arg_string(args, "port"),
+                    local_folder=str(args["localFolder"]),
+                    progress_callback=(
+                        lambda line, req_id=job.request_id: _service_emit(
+                            {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
+                        )
+                    ) if job.stream else None,
+                )
+            if job.command == "firmware.flash":
+                self._session.close(reason="firmware-flash")
+                return flash_firmware_bundle(
+                    port=_optional_arg_string(args, "port") or "",
+                    bootloader_path=str(args["bootloaderPath"]),
+                    calos_path=str(args["calOsPath"]),
+                    partition_table_path=str(args["partitionTablePath"]),
+                    progress_callback=(
+                        lambda line, req_id=job.request_id: _service_emit(
+                            {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
+                        )
+                    ) if job.stream else None,
+                )
             return {"ok": False, "error": f"Unsupported command: {job.command}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -2975,6 +3459,256 @@ def _recover_after_run_failure(controller: CalSciController) -> dict[str, Any]:
         or friendly_repl.get("error")
         or "Failed to recover friendly REPL after run.",
     }
+
+
+def _build_esptool_multi_write_cmd(
+    port: str,
+    image_pairs: list[tuple[str, Path]],
+    baudrate: int,
+    before: str,
+    after: str,
+    chip: str = FIRMWARE_FLASH_CHIP,
+    connect_attempts: int = FIRMWARE_FLASH_CONNECT_ATTEMPTS,
+) -> list[str]:
+    if importlib.util.find_spec("esptool") is not None:
+        cmd = [
+            sys.executable,
+            "-m",
+            "esptool",
+            "--chip",
+            chip,
+            "--port",
+            port,
+            "--baud",
+            str(baudrate),
+            "--connect-attempts",
+            str(connect_attempts),
+            "--before",
+            before,
+            "--after",
+            after,
+            "write-flash",
+        ]
+    else:
+        cmd = [
+            "esptool",
+            "--chip",
+            chip,
+            "--port",
+            port,
+            "--baud",
+            str(baudrate),
+            "--connect-attempts",
+            str(connect_attempts),
+            "--before",
+            before,
+            "--after",
+            after,
+            "write-flash",
+        ]
+    for offset, image_path in image_pairs:
+        cmd.extend([offset, str(image_path)])
+    return cmd
+
+
+def _run_esptool(cmd: list[str], progress_callback: Callable[[str], None] | None = None) -> None:
+    if progress_callback is not None:
+        progress_callback(f"Running: {' '.join(cmd)}")
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise ControllerError(f"esptool not found: {exc}") from exc
+
+    output_lines: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        cleaned = line.rstrip()
+        output_lines.append(cleaned)
+        if progress_callback is not None and cleaned:
+            progress_callback(cleaned)
+
+    return_code = process.wait()
+    if return_code != 0:
+        tail = "\n".join(output_lines[-10:]) if output_lines else "No output"
+        raise ControllerError(f"esptool failed (exit {return_code}).\n{tail}")
+
+
+def _is_esptool_connect_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    needles = (
+        "write timeout",
+        "failed to connect",
+        "timed out waiting for packet header",
+        "serial exception",
+        "could not open port",
+        "device not found",
+        "no serial data received",
+    )
+    return any(needle in lowered for needle in needles)
+
+
+def _retry_baud_candidates(primary_baud: int) -> list[int]:
+    bauds: list[int] = []
+    for baud in (460800, primary_baud, 230400, 115200):
+        try:
+            value = int(baud)
+        except Exception:
+            continue
+        if value > 0 and value not in bauds:
+            bauds.append(value)
+    return bauds
+
+
+def _scan_esp_ports() -> list[str]:
+    strict_ports: list[str] = []
+    fallback_ports: list[str] = []
+    for port in list_ports.comports():
+        device = str(port.device or "")
+        text = f"{port.manufacturer or ''} {port.product or ''} {port.description or ''}".lower()
+        vid = getattr(port, "vid", None)
+        if any(keyword.lower() in text for keyword in ESP32_KEYWORDS) or vid == 0x303A:
+            if device:
+                strict_ports.append(device)
+            continue
+        if device.startswith("/dev/ttyACM") or device.startswith("/dev/ttyUSB") or device.upper().startswith("COM"):
+            fallback_ports.append(device)
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for device in strict_ports + fallback_ports:
+        if device and device not in seen:
+            seen.add(device)
+            ordered.append(device)
+    return ordered
+
+
+def _wait_for_esp_port(preferred: str, progress_callback: Callable[[str], None] | None = None) -> str:
+    deadline = time.time() + FIRMWARE_FLASH_PORT_RESCAN_TIMEOUT_SEC
+    while time.time() < deadline:
+        ports = _scan_esp_ports()
+        if preferred in ports:
+            return preferred
+        if ports:
+            if progress_callback is not None and ports[0] != preferred:
+                progress_callback(f"Port changed: {preferred} -> {ports[0]}")
+            return ports[0]
+        time.sleep(FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC)
+    return preferred
+
+
+def _run_esptool_with_connect_retries(
+    image_pairs: list[tuple[str, Path]],
+    port: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str:
+    before_modes = ("default-reset", FIRMWARE_FLASH_BEFORE, "usb-reset")
+    last_error: Exception | None = None
+    attempt = 0
+
+    for before_mode in before_modes:
+        for baud in _retry_baud_candidates(FIRMWARE_FLASH_BAUDRATE):
+            attempt += 1
+            if attempt > 1 and progress_callback is not None:
+                progress_callback(f"Retry with --before {before_mode}, --baud {baud}")
+            try:
+                cmd = _build_esptool_multi_write_cmd(
+                    port=port,
+                    image_pairs=image_pairs,
+                    baudrate=baud,
+                    before=before_mode,
+                    after=FIRMWARE_FLASH_AFTER,
+                )
+                _run_esptool(cmd, progress_callback=progress_callback)
+                return _wait_for_esp_port(port, progress_callback=progress_callback)
+            except Exception as exc:
+                last_error = exc
+                if not _is_esptool_connect_error(str(exc)):
+                    raise
+                time.sleep(0.5)
+                port = _wait_for_esp_port(port, progress_callback=progress_callback)
+
+    if last_error is None:
+        raise ControllerError("firmware-upload: unknown esptool failure")
+    raise last_error
+
+
+def flash_firmware_bundle(
+    port: str,
+    bootloader_path: str,
+    calos_path: str,
+    partition_table_path: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    resolved_port = str(port or "").strip()
+    if not resolved_port:
+        return {
+            "ok": False,
+            "port": "",
+            "bootloaderPath": bootloader_path,
+            "calOsPath": calos_path,
+            "partitionTablePath": partition_table_path,
+            "error": "No port provided.",
+        }
+
+    images = {
+        "bootloader": Path(bootloader_path).expanduser().resolve(),
+        "calos": Path(calos_path).expanduser().resolve(),
+        "partition table": Path(partition_table_path).expanduser().resolve(),
+    }
+    for label, image_path in images.items():
+        if not image_path.exists():
+            return {
+                "ok": False,
+                "port": resolved_port,
+                "bootloaderPath": str(images["bootloader"]),
+                "calOsPath": str(images["calos"]),
+                "partitionTablePath": str(images["partition table"]),
+                "error": f"{label.capitalize()} image not found: {image_path}",
+            }
+        if not image_path.is_file():
+            return {
+                "ok": False,
+                "port": resolved_port,
+                "bootloaderPath": str(images["bootloader"]),
+                "calOsPath": str(images["calos"]),
+                "partitionTablePath": str(images["partition table"]),
+                "error": f"{label.capitalize()} path is not a file: {image_path}",
+            }
+
+    image_pairs = [
+        (FIRMWARE_FLASH_BOOTLOADER_OFFSET, images["bootloader"]),
+        (FIRMWARE_FLASH_PARTITION_OFFSET, images["partition table"]),
+        (FIRMWARE_FLASH_CALOS_OFFSET, images["calos"]),
+    ]
+
+    try:
+        if progress_callback is not None:
+            progress_callback("Using automatic USB reset mode.")
+            progress_callback("Flashing bootloader + partition table + CalOS...")
+        flashed_port = _run_esptool_with_connect_retries(image_pairs, resolved_port, progress_callback=progress_callback)
+        if progress_callback is not None:
+            progress_callback(f"Firmware upload complete on {flashed_port}")
+        return {
+            "ok": True,
+            "port": flashed_port,
+            "bootloaderPath": str(images["bootloader"]),
+            "calOsPath": str(images["calos"]),
+            "partitionTablePath": str(images["partition table"]),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "port": resolved_port,
+            "bootloaderPath": str(images["bootloader"]),
+            "calOsPath": str(images["calos"]),
+            "partitionTablePath": str(images["partition table"]),
+            "error": str(exc),
+        }
 
 
 def list_calsci_ports() -> list[dict[str, str]]:
@@ -3088,6 +3822,18 @@ def _device_selected_file_sizes_script(remote_paths: list[str]) -> str:
 
 def _device_selected_file_sizes_stream_script(remote_paths: list[str]) -> str:
     return _sync_scripts.device_selected_file_sizes_stream_script(remote_paths)
+
+
+def _device_scan_tree_stream_script(remote_root: str) -> str:
+    return _sync_scripts.device_scan_tree_stream_script(remote_root)
+
+
+def _device_read_file_hex_stream_script(remote_file: str, chunk_bytes: int) -> str:
+    return _sync_scripts.device_read_file_hex_stream_script(remote_file, chunk_bytes=chunk_bytes)
+
+
+def _device_read_text_file_stream_script(remote_file: str, chunk_chars: int) -> str:
+    return _sync_scripts.device_read_text_file_stream_script(remote_file, chunk_chars=chunk_chars)
 
 
 def _device_put_file_script(remote_file: str, data: bytes) -> str:
@@ -3371,6 +4117,132 @@ def _parse_device_selected_sizes_stream_output(output: str) -> dict[str, int | N
     if not snippet:
         raise ControllerError("Device targeted size scan stream returned no output.")
     raise ControllerError(f"Device targeted size scan stream produced no PATHSIZE rows: {snippet[:200]}")
+
+
+def _parse_device_tree_stream_output(output: str) -> tuple[list[str], dict[str, int]]:
+    dirs: set[str] = set()
+    files: dict[str, int] = {}
+    errors: list[str] = []
+    done_seen = False
+
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "TREE_SCAN_DONE":
+            done_seen = True
+            continue
+        if line.startswith("SCANERR:"):
+            errors.append(line[len("SCANERR:") :])
+            continue
+        if line.startswith("DIR:"):
+            payload = line[len("DIR:") :]
+            length_sep = payload.find(":")
+            if length_sep <= 0:
+                continue
+            try:
+                path_length = int(payload[:length_sep])
+            except Exception:
+                continue
+            remainder = payload[length_sep + 1 :]
+            if path_length < 0 or len(remainder) < path_length:
+                continue
+            dirs.add(remainder[:path_length])
+            continue
+        if line.startswith("FILE:"):
+            payload = line[len("FILE:") :]
+            length_sep = payload.find(":")
+            if length_sep <= 0:
+                continue
+            try:
+                path_length = int(payload[:length_sep])
+            except Exception:
+                continue
+            remainder = payload[length_sep + 1 :]
+            if path_length < 0 or len(remainder) < path_length + 2:
+                continue
+            remote_path = remainder[:path_length]
+            if len(remainder) <= path_length or remainder[path_length] != ":":
+                continue
+            size_text = remainder[path_length + 1 :]
+            try:
+                files[remote_path] = int(size_text)
+            except Exception:
+                files[remote_path] = 0
+
+    if files or dirs or done_seen:
+        return sorted(dirs), {remote_path: files[remote_path] for remote_path in sorted(files)}
+
+    if errors:
+        raise ControllerError(errors[0])
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError("Device tree scan returned no output.")
+    raise ControllerError(f"Device tree scan produced no DIR/FILE rows: {snippet[:200]}")
+
+
+def _parse_device_file_hex_output(output: str, *, remote_path: str) -> bytes:
+    chunks: list[bytes] = []
+    done_seen = False
+    error_text: str | None = None
+
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "FILE_READ_DONE":
+            done_seen = True
+            continue
+        if line.startswith("FILE_READ_ERR:"):
+            error_text = line[len("FILE_READ_ERR:") :].strip() or f"Failed to read {remote_path}"
+            continue
+        if not line.startswith("HEX:"):
+            continue
+        payload = line[len("HEX:") :]
+        try:
+            chunks.append(bytes.fromhex(payload))
+        except Exception:
+            continue
+
+    if error_text is not None:
+        raise ControllerError(error_text)
+    if chunks or done_seen:
+        return b"".join(chunks)
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError(f"Device file read returned no output for {remote_path}.")
+    raise ControllerError(f"Device file read produced no HEX rows for {remote_path}: {snippet[:200]}")
+
+
+def _parse_device_text_file_output(output: str, *, remote_path: str) -> str:
+    start_marker = "[[CALSCI_FILE_CONTENT_START]]"
+    end_marker = "[[CALSCI_FILE_CONTENT_END]]"
+    error_text: str | None = None
+
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if line.startswith("FILE_READ_ERR:"):
+            error_text = line[len("FILE_READ_ERR:") :].strip() or f"Failed to read {remote_path}"
+            break
+
+    if error_text is not None:
+        raise ControllerError(error_text)
+
+    start_index = output.find(start_marker)
+    end_index = output.find(end_marker)
+    if start_index < 0 or end_index < 0 or end_index < start_index:
+        snippet = output.strip()
+        if not snippet:
+            raise ControllerError(f"Device text file read returned no output for {remote_path}.")
+        raise ControllerError(f"Device text file read markers missing for {remote_path}: {snippet[:200]}")
+
+    content_start = output.find("\n", start_index)
+    if content_start < 0:
+        return ""
+    content = output[content_start + 1 : end_index]
+    return content.rstrip("\r\n")
 
 
 def _chunk_remote_paths_for_targeted_scan(

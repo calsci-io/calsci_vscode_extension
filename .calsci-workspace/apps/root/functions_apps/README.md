@@ -1,0 +1,1 @@
+ `menu_refresh`/`form_refresh` with `nav.current_state()`.

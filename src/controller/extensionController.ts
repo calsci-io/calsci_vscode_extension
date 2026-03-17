@@ -3,11 +3,14 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import {
+  FIRMWARE_FLASH_PATHS_KEY,
   MAX_SYNC_FOLDER_HISTORY,
   POLL_INTERVAL_MS,
   SELECTED_PORT_KEY,
   SESSION_RETRY_BACKOFF_MS,
   SYNC_FOLDER_HISTORY_KEY,
+  type FirmwareFlashResult,
+  type FirmwareFlashPaths,
   mergeHybridState,
   type BackendHybridEventPayload,
   type DeviceInfo,
@@ -20,12 +23,18 @@ import {
   type RunInteractiveFileResult,
   type SessionState,
   type SoftResetResult,
+  type WorkspaceFileResult,
   type SyncFolderResult,
   type SyncFolderSelection,
+  type WorkspaceTreeEntry,
+  type WorkspaceTreeResult,
 } from "../core/shared";
 import { BackendServiceClient } from "../backend/backendServiceClient";
 import { CalSciReplPseudoterminal } from "../ui/replTerminal";
+import { CalSciActionsViewProvider } from "../ui/actionsView";
 import { CalSciHybridPanel } from "../ui/hybridPanel";
+import { CalSciWorkspaceContentProvider, createCalSciWorkspaceUri } from "../ui/workspaceContentProvider";
+import { CalSciWorkspaceViewProvider } from "../ui/workspaceView";
 
 export class CalSciExtensionController implements vscode.Disposable {
   private readonly backend: BackendServiceClient;
@@ -34,6 +43,10 @@ export class CalSciExtensionController implements vscode.Disposable {
   private readonly runInteractiveItem: vscode.StatusBarItem;
   private readonly runOutput: vscode.OutputChannel;
   private readonly syncOutput: vscode.OutputChannel;
+  private readonly firmwareOutput: vscode.OutputChannel;
+  private readonly workspaceOutput: vscode.OutputChannel;
+  private readonly workspaceViewProvider: CalSciWorkspaceViewProvider;
+  private readonly workspaceContentProvider: CalSciWorkspaceContentProvider;
 
   private pollTimer: NodeJS.Timeout | undefined;
   private pollInFlight = false;
@@ -76,6 +89,12 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     this.runOutput = vscode.window.createOutputChannel("Run Non-Interactive File");
     this.syncOutput = vscode.window.createOutputChannel("CalSci Folder Sync");
+    this.firmwareOutput = vscode.window.createOutputChannel("CalSci Firmware Upload");
+    this.workspaceOutput = vscode.window.createOutputChannel("CalSci Workspace");
+    this.workspaceContentProvider = new CalSciWorkspaceContentProvider();
+    this.workspaceViewProvider = new CalSciWorkspaceViewProvider({
+      scanTree: async () => this.scanWorkspaceTree(),
+    });
     this.selectedPort = this.context.globalState.get<string>(SELECTED_PORT_KEY);
     this.setRunVisible(false);
 
@@ -86,6 +105,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       this.backend.onHybridEvent((event: BackendHybridEventPayload) => {
         this.handleHybridEvent(event);
       }),
+      vscode.workspace.registerTextDocumentContentProvider("calsci", this.workspaceContentProvider),
+      vscode.window.registerTreeDataProvider("calsci.actionsView", new CalSciActionsViewProvider()),
+      vscode.window.registerTreeDataProvider("calsci.workspaceView", this.workspaceViewProvider),
       vscode.window.onDidCloseTerminal((terminal: vscode.Terminal) => {
         if (terminal !== this.replTerminal) {
           return;
@@ -100,7 +122,15 @@ export class CalSciExtensionController implements vscode.Disposable {
   }
 
   public async start(): Promise<void> {
-    this.context.subscriptions.push(this.statusItem, this.runItem, this.runInteractiveItem, this.runOutput, this.syncOutput);
+    this.context.subscriptions.push(
+      this.statusItem,
+      this.runItem,
+      this.runInteractiveItem,
+      this.runOutput,
+      this.syncOutput,
+      this.firmwareOutput,
+      this.workspaceOutput,
+    );
     this.registerCommands();
     this.setInitializingStatus();
 
@@ -118,6 +148,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
 
     this.refreshStatus();
+    this.workspaceViewProvider.invalidate();
     await this.pollDevices({ forceSessionConnect: true, showTerminalOnConnect: true });
     this.pollTimer = setInterval(() => {
       void this.pollDevices();
@@ -149,12 +180,17 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.runInteractiveItem.dispose();
     this.runOutput.dispose();
     this.syncOutput.dispose();
+    this.firmwareOutput.dispose();
+    this.workspaceOutput.dispose();
   }
 
   private registerCommands(): void {
     this.context.subscriptions.push(
       vscode.commands.registerCommand("calsci.selectDevice", async () => {
         await this.selectDevice();
+      }),
+      vscode.commands.registerCommand("calsci.openTerminal", async () => {
+        await this.openTerminal();
       }),
       vscode.commands.registerCommand("calsci.softResetDevice", async () => {
         await this.softResetDevice();
@@ -167,6 +203,12 @@ export class CalSciExtensionController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand("calsci.syncFolder", async (uri?: vscode.Uri) => {
         await this.syncFolderCommand(uri);
+      }),
+      vscode.commands.registerCommand("calsci.refreshWorkspace", async () => {
+        await this.refreshWorkspaceCommand();
+      }),
+      vscode.commands.registerCommand("calsci.openWorkspaceFile", async (remotePath: string, port?: string) => {
+        await this.openWorkspaceFileCommand(remotePath, port);
       }),
       vscode.commands.registerCommand("calsci.openHybridPanel", async () => {
         await this.openHybridPanel();
@@ -575,6 +617,174 @@ export class CalSciExtensionController implements vscode.Disposable {
     );
   }
 
+  private async refreshWorkspaceCommand(): Promise<void> {
+    await this.workspaceViewProvider.reload();
+  }
+
+  private async scanWorkspaceTree(): Promise<{ port: string; entries: WorkspaceTreeEntry[] }> {
+    if (!this.backendReady) {
+      throw new Error("CalSci backend is still initializing.");
+    }
+    if (this.runInFlight) {
+      throw new Error("CalSci is busy with a run operation.");
+    }
+    if (this.operationInFlight > 0) {
+      throw new Error("CalSci is busy with another operation.");
+    }
+
+    let port: string;
+    try {
+      port = await this.resolvePortForOperation();
+    } catch (error) {
+      throw new Error(this.errorMessage(error, "No CalSci device selected."));
+    }
+
+    const connected = await this.ensureSessionForPort(port, { force: true, notifyOnError: true, showTerminal: false });
+    if (!connected) {
+      throw new Error(`Unable to connect to ${port}.`);
+    }
+
+    let result: WorkspaceTreeResult;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `CalSci: Scanning workspace on ${port}`,
+          cancellable: false,
+        },
+        async () => {
+          this.workspaceOutput.clear();
+          this.workspaceOutput.appendLine(`CalSci workspace scan on ${port}`);
+          this.workspaceOutput.appendLine("Remote root: /");
+          this.workspaceOutput.appendLine("");
+          this.workspaceOutput.show(false);
+          return this.backend.scanWorkspaceTree(port);
+        },
+      );
+    } catch (error) {
+      throw new Error(this.errorMessage(error, "Workspace scan failed."));
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+      await this.pollDevices();
+    }
+
+    this.workspaceOutput.show(false);
+
+    if (!result.ok) {
+      throw new Error(result.error ?? `Workspace scan failed on ${port}.`);
+    }
+
+    const entries = result.entries ?? [];
+    this.workspaceOutput.appendLine(`Scan complete: ${entries.length} entry(s)`);
+    return {
+      port: result.port || port,
+      entries,
+    };
+  }
+
+  private async openWorkspaceFileCommand(remotePath: string, preferredPort?: string): Promise<void> {
+    if (!this.backendReady) {
+      void vscode.window.showErrorMessage("CalSci backend is still initializing.");
+      return;
+    }
+    if (this.runInFlight) {
+      void vscode.window.showWarningMessage("CalSci is busy with a run operation.");
+      return;
+    }
+    if (this.operationInFlight > 0) {
+      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+      return;
+    }
+
+    const remoteFile = remotePath?.trim();
+    if (!remoteFile) {
+      void vscode.window.showErrorMessage("CalSci workspace file path is missing.");
+      return;
+    }
+
+    const port = preferredPort?.trim() || this.selectedPort;
+    if (!port) {
+      void vscode.window.showErrorMessage("No CalSci device selected.");
+      return;
+    }
+
+    const connected = await this.ensureSessionForPort(port, { force: true, notifyOnError: true, showTerminal: false });
+    if (!connected) {
+      return;
+    }
+
+    let result: WorkspaceFileResult;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `CalSci: Loading ${path.posix.basename(remoteFile)} from ${port}`,
+          cancellable: false,
+        },
+        async () => {
+          this.workspaceOutput.appendLine(`Fetching ${remoteFile} from ${port}`);
+          this.workspaceOutput.show(false);
+          return this.backend.readWorkspaceFile(port, remoteFile);
+        },
+      );
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, `Failed to open ${remoteFile}.`));
+      return;
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+      await this.pollDevices();
+    }
+
+    if (!result.ok || typeof result.content !== "string") {
+      const detail = result.error ? ` ${result.error}` : "";
+      void vscode.window.showErrorMessage(`Failed to open ${remoteFile}.${detail}`);
+      return;
+    }
+
+    const resolvedPort = result.port || port;
+    const uri = createCalSciWorkspaceUri(result.remotePath || remoteFile, resolvedPort);
+    this.workspaceContentProvider.setContent(uri, result.content);
+
+    try {
+      const document = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(document, { preview: false });
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, `Failed to show ${remoteFile}.`));
+    }
+  }
+
+  private async openTerminal(): Promise<void> {
+    if (!this.backendReady) {
+      void vscode.window.showErrorMessage("CalSci backend is still initializing.");
+      return;
+    }
+
+    let port: string;
+    try {
+      port = await this.resolvePortForOperation();
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      return;
+    }
+
+    const connected = await this.ensureSessionForPort(port, {
+      force: false,
+      notifyOnError: true,
+      showTerminal: true,
+    });
+    if (!connected) {
+      return;
+    }
+
+    this.showReplTerminal(false);
+  }
+
   private async resolveFolderForSync(folderUri?: vscode.Uri): Promise<SyncFolderSelection | undefined> {
     if (folderUri?.scheme === "file" && await this.isDirectoryPath(folderUri.fsPath)) {
       return this.buildSyncFolderSelection(folderUri.fsPath);
@@ -591,7 +801,7 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     const picks: Array<vscode.QuickPickItem & { folderPath?: string; browse?: boolean }> = [
       {
-        label: "$(folder-opened) Choose Folder…",
+        label: "$(folder-opened) Select Folder…",
         detail: "Browse for a local folder to sync to CalSci.",
         browse: true,
       },
@@ -607,8 +817,8 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
 
     const choice = await vscode.window.showQuickPick(picks, {
-      title: "CalSci: Sync Folder",
-      placeHolder: "Choose a recent folder or browse for another folder",
+      title: "CalSci: Select Folder",
+      placeHolder: "Choose a remembered folder or browse for another folder",
       ignoreFocusOut: true,
     });
     if (!choice) {
@@ -756,11 +966,17 @@ export class CalSciExtensionController implements vscode.Disposable {
       onDisable: async () => {
         await this.stopHybridFromPanel(false);
       },
+      onSoftReset: async () => {
+        await this.softResetDevice();
+      },
       onSyncFull: async () => {
         await this.syncHybridFullFromPanel();
       },
       onSyncFolder: async () => {
         await this.syncFolderCommand();
+      },
+      onFirmwareUpload: async () => {
+        await this.uploadFirmwareFromPanel();
       },
       onKeyPress: async (col: number, row: number) => {
         await this.sendHybridKeyFromPanel(col, row);
@@ -844,6 +1060,214 @@ export class CalSciExtensionController implements vscode.Disposable {
     } catch (error) {
       void vscode.window.showErrorMessage(this.errorMessage(error, `Hybrid key failed for c${col},r${row}.`));
     }
+  }
+
+  private async uploadFirmwareFromPanel(): Promise<void> {
+    if (!this.backendReady) {
+      void vscode.window.showErrorMessage("CalSci backend is still initializing.");
+      return;
+    }
+    if (this.runInFlight) {
+      void vscode.window.showWarningMessage("CalSci is busy with a run operation.");
+      return;
+    }
+    if (this.operationInFlight > 0) {
+      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+      return;
+    }
+
+    let port: string;
+    try {
+      port = await this.resolvePortForOperation();
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      return;
+    }
+
+    const confirm = await vscode.window.showWarningMessage(
+      `Flash bootloader, CalOS, and partition table on ${port}? This will stop the current CalSci session.`,
+      { modal: true },
+      "Yes",
+    );
+    if (confirm !== "Yes") {
+      return;
+    }
+
+    let firmwarePaths: FirmwareFlashPaths | undefined;
+    try {
+      firmwarePaths = await this.resolveFirmwareFlashPaths();
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Firmware upload aborted."));
+      return;
+    }
+    if (!firmwarePaths) {
+      return;
+    }
+
+    await this.rememberFirmwareFlashPaths(firmwarePaths);
+
+    let result: FirmwareFlashResult;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `CalSci: Uploading firmware to ${port}`,
+          cancellable: false,
+        },
+        async (progress) => {
+          this.firmwareOutput.clear();
+          this.firmwareOutput.appendLine(`CalSci firmware upload target: ${port}`);
+          this.firmwareOutput.appendLine(`Bootloader:      ${firmwarePaths.bootloaderPath}`);
+          this.firmwareOutput.appendLine(`CalOS:           ${firmwarePaths.calOsPath}`);
+          this.firmwareOutput.appendLine(`Partition table: ${firmwarePaths.partitionTablePath}`);
+          this.firmwareOutput.appendLine("");
+          this.firmwareOutput.show(false);
+
+          return this.backend.flashFirmware(port, firmwarePaths, (line: string, isError: boolean) => {
+            const formatted = isError ? `[ERROR] ${line}` : line;
+            this.firmwareOutput.appendLine(formatted);
+            progress.report({ message: formatted.slice(0, 100) });
+          });
+        },
+      );
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Firmware upload failed."));
+      return;
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+    }
+
+    this.firmwareOutput.show(false);
+    await this.persistSelectedPort(result.port || port);
+    await this.pollDevices();
+    if (result.ok) {
+      await this.ensureSessionForSelection({ force: true, notifyOnError: false, showTerminal: false });
+      const flashedPort = result.port || port;
+      if (flashedPort !== port) {
+        void vscode.window.showInformationMessage(`Firmware upload complete. Device port changed to ${flashedPort}.`);
+      } else {
+        void vscode.window.showInformationMessage(`Firmware upload complete on ${flashedPort}.`);
+      }
+      return;
+    }
+
+    const detail = result.error ? ` ${result.error}` : "";
+    void vscode.window.showErrorMessage(`Firmware upload failed on ${result.port || port}.${detail}`);
+  }
+
+  private async resolveFirmwareFlashPaths(): Promise<FirmwareFlashPaths | undefined> {
+    const remembered = await this.loadRememberedFirmwareFlashPaths();
+
+    const bootloaderPath = await this.pickFirmwareImagePath("Bootloader", remembered.bootloaderPath);
+    if (!bootloaderPath) {
+      return undefined;
+    }
+
+    const calOsPath = await this.pickFirmwareImagePath("CalOS", remembered.calOsPath);
+    if (!calOsPath) {
+      return undefined;
+    }
+
+    const partitionTablePath = await this.pickFirmwareImagePath("Partition Table", remembered.partitionTablePath);
+    if (!partitionTablePath) {
+      return undefined;
+    }
+
+    return {
+      bootloaderPath,
+      calOsPath,
+      partitionTablePath,
+    };
+  }
+
+  private async loadRememberedFirmwareFlashPaths(): Promise<Partial<FirmwareFlashPaths>> {
+    const stored = this.context.globalState.get<Partial<FirmwareFlashPaths>>(FIRMWARE_FLASH_PATHS_KEY) ?? {};
+    const normalized: Partial<FirmwareFlashPaths> = {};
+
+    for (const key of ["bootloaderPath", "calOsPath", "partitionTablePath"] as const) {
+      const candidate = stored[key];
+      if (typeof candidate !== "string" || candidate.trim().length === 0) {
+        continue;
+      }
+      const resolved = path.resolve(candidate);
+      if (await this.isFilePath(resolved)) {
+        normalized[key] = resolved;
+      }
+    }
+
+    if (
+      normalized.bootloaderPath !== stored.bootloaderPath
+      || normalized.calOsPath !== stored.calOsPath
+      || normalized.partitionTablePath !== stored.partitionTablePath
+    ) {
+      await this.context.globalState.update(FIRMWARE_FLASH_PATHS_KEY, normalized);
+    }
+
+    return normalized;
+  }
+
+  private async rememberFirmwareFlashPaths(paths: FirmwareFlashPaths): Promise<void> {
+    await this.context.globalState.update(FIRMWARE_FLASH_PATHS_KEY, {
+      bootloaderPath: path.resolve(paths.bootloaderPath),
+      calOsPath: path.resolve(paths.calOsPath),
+      partitionTablePath: path.resolve(paths.partitionTablePath),
+    } satisfies FirmwareFlashPaths);
+  }
+
+  private async pickFirmwareImagePath(label: string, rememberedPath?: string): Promise<string | undefined> {
+    const remembered = rememberedPath && await this.isFilePath(rememberedPath) ? path.resolve(rememberedPath) : undefined;
+
+    if (remembered) {
+      const choice = await vscode.window.showQuickPick(
+        [
+          {
+            label: `$(history) Use remembered ${label}`,
+            description: remembered,
+            action: "remember" as const,
+          },
+          {
+            label: `$(file) Browse for ${label}`,
+            description: "Choose a different .bin file",
+            action: "browse" as const,
+          },
+        ],
+        {
+          title: `CalSci: Select ${label} Image`,
+          placeHolder: remembered,
+          ignoreFocusOut: true,
+        },
+      );
+      if (!choice) {
+        return undefined;
+      }
+      if (choice.action === "remember") {
+        return remembered;
+      }
+    }
+
+    const workspaceFolder = vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === "file");
+    const defaultUri = remembered ? vscode.Uri.file(remembered) : workspaceFolder?.uri;
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      defaultUri,
+      openLabel: `Select ${label}`,
+      title: `CalSci: Select ${label} Image`,
+      filters: { Binary: ["bin"] },
+    });
+    if (!picked || picked.length === 0) {
+      return undefined;
+    }
+
+    const selectedPath = path.resolve(picked[0].fsPath);
+    if (path.extname(selectedPath).toLowerCase() !== ".bin") {
+      throw new Error(`${label} must be a .bin file.`);
+    }
+    return selectedPath;
   }
 
   private applyHybridSnapshot(snapshot: HybridSnapshotResult): void {
@@ -981,6 +1405,8 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
     this.selectedPort = port;
+    this.workspaceContentProvider.clear();
+    this.workspaceViewProvider.invalidate();
     await this.context.globalState.update(SELECTED_PORT_KEY, port);
     this.refreshStatus();
   }
@@ -1093,6 +1519,8 @@ export class CalSciExtensionController implements vscode.Disposable {
   }
 
   private handleSessionStateChange(state: SessionState): void {
+    const previousPort = this.sessionState.port ?? undefined;
+    const previousConnected = this.sessionState.connected;
     this.sessionState = {
       connected: state.connected,
       port: state.port ?? undefined,
@@ -1126,6 +1554,12 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
     this.hybridPanel?.updateSessionState(this.sessionState);
     this.hybridPanel?.updateHybridStatus(this.hybridStatus);
+    const portChanged = Boolean(previousPort && this.sessionState.port && previousPort !== this.sessionState.port);
+    const disconnected = previousConnected && !this.sessionState.connected;
+    if (portChanged || disconnected) {
+      this.workspaceContentProvider.clear();
+      this.workspaceViewProvider.invalidate();
+    }
     this.refreshStatus();
   }
 

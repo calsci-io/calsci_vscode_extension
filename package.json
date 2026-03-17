@@ -15,17 +15,44 @@
     "onStartupFinished",
     "onCommand:calsci.softResetDevice",
     "onCommand:calsci.selectDevice",
+    "onCommand:calsci.openTerminal",
     "onCommand:calsci.runCurrentFile",
     "onCommand:calsci.runInteractiveFile",
     "onCommand:calsci.syncFolder",
+    "onCommand:calsci.refreshWorkspace",
     "onCommand:calsci.openHybridPanel"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "calsciSidebar",
+          "title": "CalSci",
+          "icon": "media/calsci.svg"
+        }
+      ]
+    },
+    "views": {
+      "calsciSidebar": [
+        {
+          "id": "calsci.actionsView",
+          "name": "Actions"
+        },
+        {
+          "id": "calsci.workspaceView",
+          "name": "CalSci Workspace"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "calsci.softResetDevice",
-        "title": "CalSci: Soft Reset Device"
+        "title": "CalSci: Soft Reset Device",
+        "icon": {
+          "light": "media/reset.svg",
+          "dark": "media/reset.svg"
+        }
       },
       {
         "command": "calsci.selectDevice",
@@ -33,22 +60,82 @@
       },
       {
         "command": "calsci.runCurrentFile",
-        "title": "CalSci: Run Non-Interactive File"
+        "title": "CalSci: Run Non-Interactive File",
+        "icon": {
+          "light": "media/run.svg",
+          "dark": "media/run.svg"
+        }
       },
       {
         "command": "calsci.runInteractiveFile",
-        "title": "CalSci: Run Interactive File"
+        "title": "CalSci: Run Interactive File",
+        "icon": {
+          "light": "media/run-interactive.svg",
+          "dark": "media/run-interactive.svg"
+        }
+      },
+      {
+        "command": "calsci.openTerminal",
+        "title": "CalSci: Open Terminal",
+        "icon": {
+          "light": "media/chip.svg",
+          "dark": "media/chip.svg"
+        }
       },
       {
         "command": "calsci.syncFolder",
-        "title": "CalSci: Sync Folder"
+        "title": "CalSci: Select Folder"
+      },
+      {
+        "command": "calsci.refreshWorkspace",
+        "title": "CalSci: Refresh Workspace",
+        "icon": {
+          "light": "media/reset.svg",
+          "dark": "media/reset.svg"
+        }
       },
       {
         "command": "calsci.openHybridPanel",
-        "title": "CalSci: Open Hybrid Panel"
+        "title": "CalSci: Open Hybrid Panel",
+        "icon": {
+          "light": "media/calsci.svg",
+          "dark": "media/calsci.svg"
+        }
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "calsci.openHybridPanel",
+          "when": "view == calsci.actionsView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "calsci.softResetDevice",
+          "when": "view == calsci.actionsView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "calsci.runCurrentFile",
+          "when": "view == calsci.actionsView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "calsci.runInteractiveFile",
+          "when": "view == calsci.actionsView",
+          "group": "navigation@4"
+        },
+        {
+          "command": "calsci.openTerminal",
+          "when": "view == calsci.actionsView",
+          "group": "navigation@5"
+        },
+        {
+          "command": "calsci.refreshWorkspace",
+          "when": "view == calsci.workspaceView",
+          "group": "navigation@1"
+        }
+      ],
       "explorer/context": [
         {
           "command": "calsci.syncFolder",

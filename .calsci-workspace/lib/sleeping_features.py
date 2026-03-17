@@ -1,0 +1,1 @@
+achine.Pin(21, machine.Pin.OUT, value=1, hold=False)

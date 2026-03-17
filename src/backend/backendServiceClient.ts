@@ -8,6 +8,8 @@ import {
   BACKEND_TIMEOUT_BUFFER_SEC,
   type BackendHybridEventPayload,
   type BackendMessage,
+  type FirmwareFlashPaths,
+  type FirmwareFlashResult,
   type PendingBackendRequest,
   type ProcessResult,
   type RunCancelResult,
@@ -21,6 +23,9 @@ import {
   type TerminalWriteResult,
   type HybridSnapshotResult,
   type HybridKeyResult,
+  type WorkspaceFileResult,
+  type WorkspaceImportResult,
+  type WorkspaceTreeResult,
 } from "../core/shared";
 
 export class BackendServiceClient implements vscode.Disposable {
@@ -67,6 +72,7 @@ export class BackendServiceClient implements vscode.Disposable {
 
     this.venvPythonPath = venvPython;
     await this.ensurePyserialInstalled();
+    await this.ensureEsptoolInstalled();
     await this.startService();
   }
 
@@ -216,6 +222,55 @@ export class BackendServiceClient implements vscode.Disposable {
         localFolder,
         remoteFolder,
         deleteExtraneous,
+      },
+      {
+        stream: true,
+        onStream: onOutputLine,
+      },
+    );
+  }
+
+  public async importWorkspace(
+    port: string,
+    localFolder: string,
+    onOutputLine: (line: string, isError: boolean) => void,
+  ): Promise<WorkspaceImportResult> {
+    return this.request<WorkspaceImportResult>(
+      "workspace.import",
+      {
+        port,
+        localFolder,
+      },
+      {
+        stream: true,
+        onStream: onOutputLine,
+      },
+    );
+  }
+
+  public async scanWorkspaceTree(port: string): Promise<WorkspaceTreeResult> {
+    return this.request<WorkspaceTreeResult>("workspace.scan-tree", { port });
+  }
+
+  public async readWorkspaceFile(port: string, remotePath: string): Promise<WorkspaceFileResult> {
+    return this.request<WorkspaceFileResult>("workspace.read-file", {
+      port,
+      remotePath,
+    });
+  }
+
+  public async flashFirmware(
+    port: string,
+    paths: FirmwareFlashPaths,
+    onOutputLine: (line: string, isError: boolean) => void,
+  ): Promise<FirmwareFlashResult> {
+    return this.request<FirmwareFlashResult>(
+      "firmware.flash",
+      {
+        port,
+        bootloaderPath: paths.bootloaderPath,
+        calOsPath: paths.calOsPath,
+        partitionTablePath: paths.partitionTablePath,
       },
       {
         stream: true,
@@ -405,20 +460,28 @@ export class BackendServiceClient implements vscode.Disposable {
   }
 
   private async ensurePyserialInstalled(): Promise<void> {
+    await this.ensurePythonModuleInstalled("serial", "pyserial", "Failed to install pyserial in CalSci runtime.");
+  }
+
+  private async ensureEsptoolInstalled(): Promise<void> {
+    await this.ensurePythonModuleInstalled("esptool", "esptool", "Failed to install esptool in CalSci runtime.");
+  }
+
+  private async ensurePythonModuleInstalled(moduleName: string, packageName: string, failureMessage: string): Promise<void> {
     const python = this.requireVenvPython();
 
-    const check = await this.runProcess(python, ["-c", "import serial"], 10000);
+    const check = await this.runProcess(python, ["-c", `import ${moduleName}`], 10000);
     if (check.code === 0) {
       return;
     }
 
     const install = await this.runProcess(
       python,
-      ["-m", "pip", "install", "--disable-pip-version-check", "pyserial"],
+      ["-m", "pip", "install", "--disable-pip-version-check", packageName],
       180000,
     );
     if (install.code !== 0) {
-      throw new Error(this.joinStdStreams(install, "Failed to install pyserial in CalSci runtime."));
+      throw new Error(this.joinStdStreams(install, failureMessage));
     }
   }
 

@@ -1,0 +1,7 @@
+    },
+    {
+        "name": "eigen_vectors",
+        "folder": "matrix_operations",
+        "visibility": true
+    }
+]

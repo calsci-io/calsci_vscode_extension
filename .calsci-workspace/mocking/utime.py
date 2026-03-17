@@ -1,0 +1,1 @@
+_time.mktime(time_tuple))

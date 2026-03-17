@@ -1,0 +1,1 @@
+with `menu_refresh.refresh(state=nav.current_state())`.
