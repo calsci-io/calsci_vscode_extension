@@ -13,8 +13,11 @@ Service contract:
 from __future__ import annotations
 
 import argparse
+import ast
 import codecs
 import json
+import os
+import posixpath
 import queue
 import re
 import sys
@@ -27,6 +30,13 @@ from typing import Any, Callable
 
 import serial
 from serial.tools import list_ports
+
+try:
+    from . import sync_core as _sync_core  # type: ignore[import-not-found]
+    from . import sync_scripts as _sync_scripts  # type: ignore[import-not-found]
+except Exception:
+    import sync_core as _sync_core
+    import sync_scripts as _sync_scripts
 
 try:
     import fcntl
@@ -47,8 +57,13 @@ RAW_REPL_EXIT_TIMEOUT_SEC = 2.0
 RAW_REPL_CANCEL_TIMEOUT_SEC = 5.0
 RAW_REPL_BANNER = b"raw REPL; CTRL-B to exit\r\n"
 RAW_REPL_PROMPT = RAW_REPL_BANNER + b">"
+FRIENDLY_PASTE_ENTER_TIMEOUT_SEC = 1.5
+FRIENDLY_PASTE_RECOVERY_TIMEOUT_SEC = 2.0
+FRIENDLY_PASTE_PROMPT = b"=== "
+FRIENDLY_PASTE_CHUNK_BYTES = 256
+FRIENDLY_PASTE_CHUNK_DELAY_SEC = 0.01
 PORT_OPEN_SETTLE_SEC = 0.12
-READER_PAUSE_WAIT_SEC = 0.5
+READER_PAUSE_WAIT_SEC = 2.0
 HYBRID_HELPER_COMMAND_TIMEOUT_SEC = 1.2
 HYBRID_HELPER_ENABLE_TIMEOUT_SEC = 1.5
 HYBRID_HELPER_POLL_TIMEOUT_SEC = 0.45
@@ -56,6 +71,27 @@ HYBRID_HELPER_POLL_INTERVAL_SEC = 0.025
 HYBRID_HELPER_REPL_QUIET_SEC = 2.5
 SOFT_RESET_BREAK_DELAY_SEC = 0.05
 SOFT_RESET_TIMEOUT_FALLBACK_SEC = 2.5
+SYNC_DEVICE_COMMAND_TIMEOUT_SEC = 15.0
+SYNC_DIR_COMMAND_TIMEOUT_SEC = 6.0
+SYNC_SCAN_COMMAND_TIMEOUT_SEC = 25.0
+SYNC_FILE_SCRIPT_CHUNK_BYTES = 512
+SYNC_SIGNATURE_SCAN_TIMEOUT_SEC = 60.0
+SYNC_FILE_UPLOAD_TIMEOUT_SEC = 5.0
+SYNC_REPL_DELAY_SEC = 0.01
+SYNC_FILE_RETRY_COUNT = 2
+SYNC_FILE_RETRY_DELAY_SEC = 0.2
+SYNC_FILE_RETRY_RECONNECT_DELAY_SEC = 3.0
+SYNC_FAST_COMPARE_TARGET_SEC = 5.0
+SYNC_DYNAMIC_RECENT_WINDOW_SEC = 300.0
+SYNC_DYNAMIC_SIGNATURE_MARGIN_SEC = 0.35
+SYNC_DYNAMIC_SIGNATURE_BYTES_PER_SEC = 32768.0
+SYNC_DYNAMIC_MAX_SIGNATURE_FILES = 64
+SYNC_UPLOAD_ONLY_FAST_SCAN_MIN_FILES = 32
+SYNC_UPLOAD_ONLY_FAST_SCAN_MAX_FILES = 512
+SYNC_TARGETED_SCAN_BATCH_SIZE = 64
+SYNC_TARGETED_SCAN_MAX_SCRIPT_CHARS = 2600
+SYNC_TARGETED_VERIFY_MAX_FILES = 64
+SYNC_TARGETED_VERIFY_TIMEOUT_SEC = 8.0
 SOFT_RESET_REBOOT_MARKERS = (
     b"soft reboot",
     b"CalSci - Triple Boot System",
@@ -66,7 +102,9 @@ COMMAND_PRIORITY = {
     "terminal.write": 6,
     "hybrid.key": 7,
     "hybrid.sync-full": 8,
+    "run-file-interactive": 9,
     "run-file": 10,
+    "sync-folder": 11,
     "hybrid.start": 11,
     "hybrid.stop": 12,
     "soft-reset": 20,
@@ -81,6 +119,8 @@ EVENT_SESSION = "session"
 EVENT_TERMINAL_OUTPUT = "terminal-output"
 EVENT_HYBRID = "hybrid"
 FRIENDLY_REPL_PROMPTS = (b"CalSci >>>", b">>>")
+HELPER_FRAME_PREFIX = "{{CALSCI_HYB:"
+HELPER_FRAME_SUFFIX = "}}"
 
 
 class ControllerError(RuntimeError):
@@ -130,6 +170,14 @@ def _join_non_empty_text(parts: list[str]) -> str:
     return "".join(part for part in parts if part)
 
 
+def _normalize_friendly_paste_source(source: str | bytes) -> bytes:
+    if isinstance(source, bytes):
+        text = source.decode("utf-8")
+    else:
+        text = source
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
 def _extract_state_payloads(text: str) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     decoder = json.JSONDecoder()
@@ -169,14 +217,29 @@ def _extract_state_payloads(text: str) -> list[dict[str, Any]]:
         scan = left + 1
 
 
+def _strip_repl_prompt_prefix(text: str) -> str:
+    return re.sub(r"^(?:CalSci >>>|>>>)\s*", "", text)
+
+
+def _unwrap_helper_frame(text: str) -> str | None:
+    if not text.startswith(HELPER_FRAME_PREFIX):
+        return None
+    if not text.endswith(HELPER_FRAME_SUFFIX):
+        return None
+    return text[len(HELPER_FRAME_PREFIX) : -len(HELPER_FRAME_SUFFIX)]
+
+
 def _clean_helper_line(line: str) -> str:
     cleaned = line.replace("\r", "").strip()
-    cleaned = re.sub(r"^(?:CalSci >>>|>>>)\s*", "", cleaned)
+    cleaned = _strip_repl_prompt_prefix(cleaned)
+    framed = _unwrap_helper_frame(cleaned)
+    if framed is not None:
+        cleaned = framed
     return cleaned.strip()
 
 
 def _parse_helper_output(text: str, command: str | None = None) -> dict[str, Any]:
-    states = _extract_state_payloads(text)
+    states: list[dict[str, Any]] = []
     lines: list[str] = []
     command_text = (command or "").strip()
     for raw_line in text.replace("\r", "\n").split("\n"):
@@ -186,6 +249,7 @@ def _parse_helper_output(text: str, command: str | None = None) -> dict[str, Any
         if command_text and cleaned == command_text:
             continue
         lines.append(cleaned)
+        states.extend(_extract_state_payloads(cleaned))
     return {
         "text": text,
         "lines": lines,
@@ -197,7 +261,7 @@ def _is_prompt_only_fragment(text: str) -> bool:
     fragment = text.replace("\r", "").strip()
     if not fragment:
         return False
-    cleaned = re.sub(r"^(?:CalSci >>>|>>>)\s*", "", fragment)
+    cleaned = _strip_repl_prompt_prefix(fragment)
     if cleaned:
         return False
     return fragment.startswith("CalSci >>>") or fragment.startswith(">>>")
@@ -221,15 +285,51 @@ _HELPER_TERMINAL_PREFIXES = (
     "HYBRID_BAUD:",
 )
 
+_HELPER_TERMINAL_FRAGMENT_TOKENS = (
+    "{{CALSCI_HYB",
+    "_hyb_",
+    "ECHO:VSCODE_",
+    "HYB_",
+    "HYBRID_",
+    "STATE:",
+)
+
+_HELPER_STATE_FRAGMENT_TOKENS = (
+    '"frame_id"',
+    '"fb"',
+    '"fb_full"',
+    '"fb_seen"',
+    '"lines"',
+    '"nav"',
+    '"mode"',
+    '"capture_enabled"',
+    '"start_line"',
+    '"all_points_on"',
+    '"adc_reverse"',
+    '"com_reverse"',
+    '"invert"',
+)
+
+
+def _looks_like_helper_terminal_fragment(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = _clean_helper_line(text)
+    if not cleaned:
+        return False
+    if cleaned.startswith(_HELPER_TERMINAL_PREFIXES):
+        return True
+    if any(token in cleaned for token in _HELPER_TERMINAL_FRAGMENT_TOKENS):
+        return True
+    if "{" in cleaned and any(token in cleaned for token in _HELPER_STATE_FRAGMENT_TOKENS):
+        return True
+    return False
+
 
 def _looks_like_helper_terminal_line(line: str) -> bool:
     if not line:
         return False
-    if line.startswith("_hyb_"):
-        return True
-    if line.startswith("ECHO:VSCODE_"):
-        return True
-    if line.startswith(_HELPER_TERMINAL_PREFIXES):
+    if _looks_like_helper_terminal_fragment(line):
         return True
     return bool(_extract_state_payloads(line))
 
@@ -237,27 +337,11 @@ def _looks_like_helper_terminal_line(line: str) -> bool:
 class CalSciController:
     def __init__(self, port: str, baudrate: int = DEFAULT_BAUDRATE, *, exclusive: bool = False):
         self.port = port
-        self._conn = serial.Serial()
-        self._conn.port = port
-        self._conn.baudrate = baudrate
-        self._conn.timeout = 0.01
-        self._conn.write_timeout = 1.0
-        try:
-            self._conn.exclusive = exclusive
-        except Exception:
-            pass
-        self._conn.dsrdtr = False
-        self._conn.rtscts = False
-        try:
-            self._conn.dtr = False
-            self._conn.rts = False
-        except Exception:
-            pass
-        self._conn.open()
-        self._enable_kernel_exclusive_lock(exclusive)
-        time.sleep(PORT_OPEN_SETTLE_SEC)
+        self._baudrate = baudrate
+        self._exclusive = exclusive
         self._in_raw_repl = False
         self._write_lock = threading.Lock()
+        self._conn = self._open_connection()
 
     def close(self) -> None:
         try:
@@ -265,7 +349,29 @@ class CalSciController:
         except Exception:
             pass
 
-    def _enable_kernel_exclusive_lock(self, exclusive: bool) -> None:
+    def _open_connection(self) -> serial.Serial:
+        conn = serial.Serial()
+        conn.port = self.port
+        conn.baudrate = self._baudrate
+        conn.timeout = 0.01
+        conn.write_timeout = 1.0
+        try:
+            conn.exclusive = self._exclusive
+        except Exception:
+            pass
+        conn.dsrdtr = False
+        conn.rtscts = False
+        try:
+            conn.dtr = False
+            conn.rts = False
+        except Exception:
+            pass
+        conn.open()
+        self._enable_kernel_exclusive_lock(conn, self._exclusive)
+        time.sleep(PORT_OPEN_SETTLE_SEC)
+        return conn
+
+    def _enable_kernel_exclusive_lock(self, conn: serial.Serial, exclusive: bool) -> None:
         if not exclusive or fcntl is None or termios is None:
             return
 
@@ -274,10 +380,33 @@ class CalSciController:
             return
 
         try:
-            fcntl.ioctl(self._conn.fileno(), ioctl_code)
+            fcntl.ioctl(conn.fileno(), ioctl_code)
         except OSError as exc:
-            self.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
             raise ControllerError(f"Could not exclusively lock port {self.port}: {exc}") from exc
+
+    def sync_reconnect(self, delay_seconds: float = SYNC_FILE_RETRY_RECONNECT_DELAY_SEC) -> None:
+        with self._write_lock:
+            try:
+                self._conn.dtr = False
+                self._conn.rts = True
+                self._conn.dtr = True
+                self._conn.rts = False
+            except Exception:
+                pass
+
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+            self._in_raw_repl = False
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            self._conn = self._open_connection()
 
     def write_terminal(self, data: bytes) -> None:
         if not data:
@@ -302,15 +431,25 @@ class CalSciController:
         return bytes(drained)
 
     def _write_bytes(self, data: bytes, flush: bool = True) -> None:
+        if not data:
+            return
         last_exc: Exception | None = None
         for attempt in range(BACKEND_WRITE_RETRIES):
             try:
                 with self._write_lock:
-                    self._conn.write(data)
+                    sent = 0
+                    view = memoryview(data)
+                    while sent < len(view):
+                        wrote = self._conn.write(view[sent:])
+                        if wrote is None:
+                            wrote = 0
+                        if wrote <= 0:
+                            raise serial.SerialTimeoutException("Serial write stalled")
+                        sent += int(wrote)
                     if flush:
                         self._conn.flush()
                 return
-            except (serial.SerialException, serial.SerialTimeoutException) as exc:
+            except (serial.SerialException, serial.SerialTimeoutException, OSError, ValueError) as exc:
                 last_exc = exc
                 time.sleep(0.04 * (attempt + 1))
         if last_exc is not None:
@@ -388,12 +527,14 @@ class CalSciController:
 
         self._write_bytes(b"\r\x01", flush=True)
         data = self._raw_read_until(RAW_REPL_BANNER, timeout=1.0, timeout_overall=timeout_overall)
-        if not data.endswith(RAW_REPL_BANNER):
+        if RAW_REPL_BANNER not in data:
             raise ControllerError(f"could not enter raw REPL: {data!r}")
 
-        prompt = self._raw_read_until(b">", timeout=0.5, timeout_overall=1.0)
-        if not prompt.endswith(b">"):
-            raise ControllerError(f"raw prompt missing after banner: {prompt!r}")
+        after_banner = data.split(RAW_REPL_BANNER, 1)[1]
+        if b">" not in after_banner:
+            prompt = self._raw_read_until(b">", timeout=0.5, timeout_overall=1.0)
+            if not prompt.endswith(b">"):
+                raise ControllerError(f"raw prompt missing after banner: {prompt!r}")
 
         self._in_raw_repl = True
 
@@ -501,6 +642,34 @@ class CalSciController:
             "output": output,
         }
 
+    def exec_friendly_source_start(self, source: str | bytes) -> dict[str, bytes]:
+        pending = self.drain_terminal_available()
+        self._write_bytes(b"\r\x03", flush=True)
+        time.sleep(SOFT_RESET_BREAK_DELAY_SEC)
+        interrupt_output = self.drain_terminal_available()
+        if interrupt_output:
+            pending += interrupt_output
+
+        self._write_bytes(b"\r\x05", flush=True)
+        banner = self._raw_read_until(
+            FRIENDLY_PASTE_PROMPT,
+            timeout=0.5,
+            timeout_overall=FRIENDLY_PASTE_ENTER_TIMEOUT_SEC,
+        )
+        if not banner.endswith(FRIENDLY_PASTE_PROMPT):
+            raise ControllerError(f"friendly paste prompt missing after enter: {banner!r}")
+
+        source_bytes = _normalize_friendly_paste_source(source)
+        for start in range(0, len(source_bytes), FRIENDLY_PASTE_CHUNK_BYTES):
+            chunk = source_bytes[start : start + FRIENDLY_PASTE_CHUNK_BYTES]
+            self._write_bytes(chunk, flush=False)
+            time.sleep(FRIENDLY_PASTE_CHUNK_DELAY_SEC)
+        self._write_bytes(b"\x04", flush=True)
+
+        return {
+            "pending": pending,
+        }
+
     def exec_source(
         self,
         source: str,
@@ -532,6 +701,343 @@ class CalSciController:
 
         return output, error
 
+    def exec_source_in_raw_repl(
+        self,
+        source: str,
+        timeout_seconds: float,
+        line_callback: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[bytes, bytes]:
+        if not self._in_raw_repl:
+            raise ControllerError("raw REPL is not active")
+        try:
+            self._exec_raw_no_follow(source)
+            output, error, interrupted = self._raw_follow(
+                timeout_seconds if timeout_seconds > 0 else None,
+                line_callback=line_callback,
+                cancel_event=cancel_event,
+            )
+        except Exception:
+            self._in_raw_repl = False
+            raise
+
+        if interrupted:
+            raise RunCancelledError(output)
+
+        return output, error
+
+    def sync_enter_friendly_repl(self) -> None:
+        self._write_bytes(b"\x03\x03", flush=True)
+        time.sleep(SYNC_REPL_DELAY_SEC)
+        self._sync_reset_input_buffer()
+        self._write_bytes(b"\x01", flush=True)
+        time.sleep(SYNC_REPL_DELAY_SEC)
+        self._sync_reset_input_buffer()
+        self._write_bytes(b"\x02", flush=True)
+        time.sleep(SYNC_REPL_DELAY_SEC)
+        self._sync_reset_input_buffer()
+        self._in_raw_repl = False
+
+    def sync_enter_raw_repl(self) -> None:
+        self._write_bytes(b"\x03\x03", flush=True)
+        time.sleep(SYNC_REPL_DELAY_SEC)
+        self._sync_reset_input_buffer()
+        self._write_bytes(b"\x01", flush=True)
+        time.sleep(SYNC_REPL_DELAY_SEC)
+        self._sync_reset_input_buffer()
+        self._in_raw_repl = True
+
+    def sync_exit_raw_repl(self) -> None:
+        self._write_bytes(b"\x03\x03", flush=True)
+        time.sleep(SYNC_REPL_DELAY_SEC)
+        self._write_bytes(b"\x02", flush=True)
+        time.sleep(SYNC_REPL_DELAY_SEC)
+        self._sync_reset_input_buffer()
+        self._in_raw_repl = False
+
+    def sync_exec_raw_and_read(self, code: str, timeout: float = 5.0) -> str:
+        opened_here = False
+        if not self._in_raw_repl:
+            self._enter_raw_repl(timeout_overall=max(RAW_REPL_ENTER_TIMEOUT_SEC, timeout))
+            opened_here = True
+        try:
+            self._exec_raw_no_follow(code)
+            output, error, interrupted = self._raw_follow(
+                timeout if timeout > 0 else None,
+                line_callback=None,
+                cancel_event=None,
+            )
+        except Exception:
+            # Existing raw session might be out of sync after a command failure.
+            if not opened_here:
+                self._in_raw_repl = False
+            raise
+        finally:
+            if opened_here:
+                try:
+                    self._exit_raw_repl()
+                except Exception:
+                    self._in_raw_repl = False
+                    raise
+
+        if interrupted:
+            raise ControllerError("Sync command interrupted")
+
+        stderr_text = error.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            raise ControllerError(stderr_text)
+
+        result = output.decode(errors="ignore")
+        if "Traceback" in result:
+            raise ControllerError(result)
+        return result
+
+    def sync_exec_friendly_and_read(self, code: str, timeout: float = 5.0) -> str:
+        payload = self.exec_friendly_source_start(code)
+        pending = payload.get("pending", b"")
+        prompt_seen, output = self._read_until_friendly_prompt(timeout)
+        text = pending.decode("utf-8", errors="replace") + output.decode("utf-8", errors="replace")
+        if not prompt_seen:
+            snippet = text.strip()
+            if snippet:
+                raise ControllerError(f"friendly REPL prompt missing after sync command: {snippet[:200]}")
+            raise ControllerError("friendly REPL prompt missing after sync command")
+        if "Traceback" in text:
+            raise ControllerError(text)
+        return text
+
+    def sync_get_file_sizes(self, remote_root: str, timeout: float = SYNC_SCAN_COMMAND_TIMEOUT_SEC) -> dict[str, int]:
+        code = _device_list_file_sizes_script(remote_root)
+        raw = ""
+        last_error: Exception | None = None
+        stream_code = _device_list_file_sizes_stream_script(remote_root)
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+        if last_error is not None:
+            try:
+                stream_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_sizes_stream_output(stream_raw)
+            except Exception as friendly_exc:
+                raise ControllerError(f"{last_error} | friendly scan failed: {friendly_exc}") from friendly_exc
+
+        try:
+            return _parse_device_sizes_output(raw)
+        except ControllerError as exc:
+            # Fallback to line-stream parser when large dict repr output is truncated.
+            error_text = str(exc)
+            if "Device size scan marker missing" not in error_text and "Device size scan returned no output" not in error_text:
+                raise
+
+            try:
+                stream_raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+            except Exception:
+                stream_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+            return _parse_device_sizes_stream_output(stream_raw)
+
+    def sync_get_file_signatures(
+        self,
+        remote_paths: list[str],
+        timeout: float = SYNC_SIGNATURE_SCAN_TIMEOUT_SEC,
+    ) -> dict[str, str | None]:
+        code = _device_list_file_signatures_script(remote_paths)
+        stream_code = _device_list_file_signatures_stream_script(remote_paths)
+        raw = ""
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+        if last_error is not None:
+            try:
+                stream_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_signatures_stream_output(stream_raw)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly signature scan failed: {friendly_exc}"
+                ) from friendly_exc
+
+        try:
+            return _parse_device_signatures_output(raw)
+        except ControllerError as exc:
+            # Fallback to line-stream parser when large dict repr output is truncated.
+            error_text = str(exc)
+            if (
+                "Device signature scan marker missing" not in error_text
+                and "Device signature scan returned no output" not in error_text
+            ):
+                raise
+
+            try:
+                stream_raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+            except Exception:
+                stream_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+            return _parse_device_signatures_stream_output(stream_raw)
+
+    def sync_get_selected_file_sizes(
+        self,
+        remote_paths: list[str],
+        timeout: float = SYNC_TARGETED_VERIFY_TIMEOUT_SEC,
+    ) -> dict[str, int | None]:
+        if not remote_paths:
+            return {}
+
+        result: dict[str, int | None] = {}
+        path_batches = _chunk_remote_paths_for_targeted_scan(remote_paths)
+        for batch_paths in path_batches:
+            batch_timeout = max(2.0, min(timeout, 1.2 + (len(batch_paths) * 0.05)))
+            result.update(CalSciController._sync_get_selected_file_sizes_batch(self, batch_paths, timeout=batch_timeout))
+        return result
+
+    def _sync_get_selected_file_sizes_batch(
+        self,
+        remote_paths: list[str],
+        timeout: float,
+    ) -> dict[str, int | None]:
+        code = _device_selected_file_sizes_script(remote_paths)
+        stream_code = _device_selected_file_sizes_stream_script(remote_paths)
+
+        raw = ""
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(code, timeout=timeout)
+                try:
+                    return _parse_device_selected_sizes_output(friendly_raw)
+                except ControllerError:
+                    friendly_stream_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                    return _parse_device_selected_sizes_stream_output(friendly_stream_raw)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly targeted size scan failed: {friendly_exc}"
+                ) from friendly_exc
+
+        try:
+            return _parse_device_selected_sizes_output(raw)
+        except ControllerError as exc:
+            error_text = str(exc)
+            if (
+                "Device targeted size scan marker missing" not in error_text
+                and "Device targeted size scan returned no output" not in error_text
+            ):
+                raise
+
+            try:
+                stream_raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+            except Exception:
+                stream_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+            return _parse_device_selected_sizes_stream_output(stream_raw)
+
+    def sync_mkdir(self, path: str) -> bool:
+        target = json.dumps(path)
+        code = (
+            "import os\r\n"
+            "try:\r\n"
+            f"    os.mkdir({target})\r\n"
+            "except:\r\n"
+            "    pass\r\n"
+            "try:\r\n"
+            f"    os.stat({target})\r\n"
+            "    print('EXISTS')\r\n"
+            "except:\r\n"
+            "    print('MISSING')\r\n"
+        )
+        result = self.sync_exec_raw_and_read(code, timeout=1.0)
+        return "EXISTS" in result
+
+    def sync_delete_file(self, path: str) -> bool:
+        target = json.dumps(path)
+        code = (
+            "import os\r\n"
+            "try:\r\n"
+            f"    os.remove({target})\r\n"
+            "    print('DELETED')\r\n"
+            "except Exception as e:\r\n"
+            "    print('ERROR:' + str(e))\r\n"
+        )
+        result = self.sync_exec_raw_and_read(code, timeout=3.0)
+        return "DELETED" in result
+
+    def sync_put_raw(self, local_path: Path, remote_path: str) -> None:
+        if not self._in_raw_repl:
+            raise ControllerError("raw REPL is not active")
+
+        data = local_path.read_bytes()
+        total_len = len(data)
+        num_chunks = (total_len + SYNC_FILE_SCRIPT_CHUNK_BYTES - 1) // SYNC_FILE_SCRIPT_CHUNK_BYTES
+
+        self._sync_reset_input_buffer()
+
+        lines = [
+            "import os",
+            "try:",
+            f"    os.remove({json.dumps(remote_path)})",
+            "except OSError:",
+            "    pass",
+            f"f = open({json.dumps(remote_path)}, \"wb\")",
+        ]
+        for index in range(num_chunks):
+            chunk = data[index * SYNC_FILE_SCRIPT_CHUNK_BYTES : (index + 1) * SYNC_FILE_SCRIPT_CHUNK_BYTES]
+            lines.append(f"f.write({repr(chunk)})")
+        lines.extend([
+            "f.close()",
+            'print("OK")',
+        ])
+
+        code = "\r\n".join(lines) + "\r\n"
+        self._exec_raw_no_follow(code)
+        output, error, interrupted = self._raw_follow(
+            SYNC_FILE_UPLOAD_TIMEOUT_SEC,
+            line_callback=None,
+            cancel_event=None,
+        )
+        if interrupted:
+            raise ControllerError("Sync upload interrupted")
+
+        stderr_text = error.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            raise ControllerError(stderr_text)
+
+        stdout_text = output.decode("utf-8", errors="replace")
+        if "Traceback" in stdout_text:
+            raise ControllerError(stdout_text.strip())
+        if "OK" not in stdout_text:
+            preview = stdout_text.strip()
+            raise ControllerError(f"No OK confirmation: {preview[:200]}")
+
+    def _sync_reset_input_buffer(self) -> None:
+        try:
+            self._conn.reset_input_buffer()
+        except Exception:
+            pass
+
     def recover_friendly_repl(self, timeout_seconds: float) -> dict[str, Any]:
         self._drain_serial_input()
         self._write_bytes(b"\x03\x03", flush=True)
@@ -547,6 +1053,20 @@ class CalSciController:
         }
         if not prompt_seen:
             payload["error"] = "Friendly REPL prompt not detected after run recovery."
+        return payload
+
+    def recover_friendly_prompt(self, timeout_seconds: float) -> dict[str, Any]:
+        self._write_bytes(b"\x03\r", flush=True)
+        prompt_seen, output_bytes = self._read_until_friendly_prompt(timeout_seconds)
+        output = output_bytes.decode("utf-8", errors="replace")
+        payload = {
+            "ok": prompt_seen,
+            "promptSeen": prompt_seen,
+            "port": self.port,
+            "output": output,
+        }
+        if not prompt_seen:
+            payload["error"] = "Friendly REPL prompt not detected after interactive run recovery."
         return payload
 
     def soft_reset(self, timeout_seconds: float) -> dict[str, Any]:
@@ -631,6 +1151,7 @@ class PersistentSession:
         self._helper_line_seq = 0
         self._helper_state_seq = 0
         self._suppress_terminal_helper_output = False
+        self._suppress_terminal_helper_depth = 0
         self._suppress_terminal_helper_output_deadline = 0.0
         self._suppress_terminal_helper_activity_seen = False
 
@@ -852,6 +1373,618 @@ class PersistentSession:
             }
         return payload
 
+    def run_file_interactive(
+        self,
+        port: str | None,
+        local_file: str,
+    ) -> dict[str, Any]:
+        try:
+            local_path, source = _load_local_text_file(local_file)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "port": port or "",
+                "localFile": str(Path(local_file).expanduser().resolve()),
+                "error": str(exc),
+            }
+
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "localFile": str(local_path),
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        pending_bytes = b""
+        recovery_payload: dict[str, Any] | None = None
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "localFile": str(local_path),
+                    "error": str(exc),
+                }
+
+            try:
+                with self._hybrid_lock:
+                    if self._hybrid_active:
+                        self._hybrid_repl_quiet_until = time.monotonic() + HYBRID_HELPER_REPL_QUIET_SEC
+                        self._hybrid_pause_until_prompt = True
+
+                start_payload = controller.exec_friendly_source_start(source)
+                pending_bytes = start_payload.get("pending", b"")
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "localFile": str(local_path),
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "localFile": str(local_path),
+                    "error": str(exc),
+                }
+                recovery_payload = controller.recover_friendly_prompt(FRIENDLY_PASTE_RECOVERY_TIMEOUT_SEC)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if pending_bytes:
+            self._emit_terminal_text(pending_bytes.decode("utf-8", errors="replace"))
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after interactive run"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def sync_folder(
+        self,
+        port: str | None,
+        local_folder: str,
+        remote_folder: str,
+        delete_extraneous: bool = False,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            local_root, directories, files = _scan_local_folder(local_folder, remote_folder)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "port": port or "",
+                "localFolder": str(Path(local_folder).expanduser().resolve()),
+                "remoteFolder": str(remote_folder),
+                "error": str(exc),
+            }
+
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "localFolder": str(local_root),
+                    "remoteFolder": directories[0],
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        def report(line: str) -> None:
+            if progress_callback is not None:
+                progress_callback(line)
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "localFolder": str(local_root),
+                    "remoteFolder": directories[0],
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                # Fast path: keep one raw REPL session open across sync operations
+                # instead of enter/exit for every scan/dir/delete command.
+                try:
+                    enter_raw = getattr(controller, "_enter_raw_repl", None)
+                    if callable(enter_raw):
+                        enter_raw(timeout_overall=RAW_REPL_ENTER_TIMEOUT_SEC)
+                except Exception:
+                    pass
+
+                remote_root = directories[0]
+                compare_started_at = time.monotonic()
+                report(f"Scanning {remote_root} on device…")
+                remote_scan_ok = False
+                remote_scan_error: Exception | None = None
+                remote_sizes: dict[str, int] = {}
+                local_map = {str(file_info["remote_path"]): file_info for file_info in files}
+                used_targeted_remote_scan = False
+                targeted_probe = getattr(controller, "sync_get_selected_file_sizes", None)
+                should_try_targeted_scan = (
+                    not delete_extraneous
+                    and callable(targeted_probe)
+                    and SYNC_UPLOAD_ONLY_FAST_SCAN_MIN_FILES <= len(local_map) <= SYNC_UPLOAD_ONLY_FAST_SCAN_MAX_FILES
+                )
+
+                if should_try_targeted_scan:
+                    target_paths = sorted(local_map.keys())
+                    targeted_timeout = min(
+                        SYNC_SCAN_COMMAND_TIMEOUT_SEC,
+                        max(3.0, 1.5 + (len(target_paths) * 0.03)),
+                    )
+                    for attempt in range(2):
+                        try:
+                            selected_sizes = targeted_probe(target_paths, timeout=targeted_timeout)
+                            remote_sizes = {
+                                remote_path: int(file_size)
+                                for remote_path, file_size in selected_sizes.items()
+                                if isinstance(file_size, int)
+                            }
+                            remote_scan_ok = True
+                            remote_scan_error = None
+                            used_targeted_remote_scan = True
+                            missing_count = max(0, len(target_paths) - len(remote_sizes))
+                            report(
+                                f"Upload-only fast scan: found {len(remote_sizes)} existing file(s), "
+                                f"{missing_count} missing."
+                            )
+                            break
+                        except ControllerError as exc:
+                            remote_scan_error = exc
+                            if attempt == 0:
+                                scan_recovery = _recover_after_run_failure(controller)
+                                if scan_recovery.get("output"):
+                                    self._emit_terminal_text(str(scan_recovery["output"]))
+                                if not scan_recovery.get("ok"):
+                                    restore_error = scan_recovery.get("error") or "Unknown recovery failure"
+                                    raise ControllerError(f"{exc} | scan recovery failed: {restore_error}") from exc
+                                report(f"Upload-only fast scan failed ({exc}). Retrying after REPL recovery…")
+                                continue
+                            break
+                        except Exception as exc:
+                            remote_scan_error = exc
+                            if attempt == 0:
+                                report(f"Upload-only fast scan unavailable ({exc}). Retrying once…")
+                                continue
+                            break
+
+                    if not remote_scan_ok and remote_scan_error is not None:
+                        report(
+                            f"Upload-only fast scan failed ({remote_scan_error}). "
+                            "Falling back to subtree scan…"
+                        )
+
+                if not remote_scan_ok:
+                    for attempt in range(2):
+                        try:
+                            remote_sizes = controller.sync_get_file_sizes(
+                                remote_root,
+                                timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC,
+                            )
+                            report(f"Remote subtree has {len(remote_sizes)} file(s)")
+                            remote_scan_ok = True
+                            remote_scan_error = None
+                            break
+                        except ControllerError as exc:
+                            remote_scan_error = exc
+                            if attempt == 0:
+                                scan_recovery = _recover_after_run_failure(controller)
+                                if scan_recovery.get("output"):
+                                    self._emit_terminal_text(str(scan_recovery["output"]))
+                                if not scan_recovery.get("ok"):
+                                    restore_error = scan_recovery.get("error") or "Unknown recovery failure"
+                                    raise ControllerError(f"{exc} | scan recovery failed: {restore_error}") from exc
+                                report(f"Remote scan failed ({exc}). Retrying after REPL recovery…")
+                                continue
+                            break
+                        except Exception as exc:
+                            remote_scan_error = exc
+                            if attempt == 0:
+                                report(f"Remote scan unavailable ({exc}). Retrying once…")
+                                continue
+                            break
+
+                if not remote_scan_ok:
+                    report(f"Remote scan failed ({remote_scan_error}). Falling back to full upload.")
+                if remote_scan_ok and not remote_sizes and local_map:
+                    if used_targeted_remote_scan:
+                        report("Device scan found no matching local file(s). Full upload required.")
+                    else:
+                        report("Remote subtree is empty. Full upload required.")
+                same_size_candidates = [
+                    remote_path
+                    for remote_path, file_info in sorted(local_map.items())
+                    if remote_sizes.get(remote_path) == int(file_info["size_bytes"])
+                ]
+                signature_matches: set[str] | None = None
+                size_fallback_paths: set[str] | None = None
+                if same_size_candidates:
+                    compare_elapsed_sec = time.monotonic() - compare_started_at
+                    compare_remaining_sec = max(0.0, SYNC_FAST_COMPARE_TARGET_SEC - compare_elapsed_sec)
+                    recent_cutoff = time.time() - SYNC_DYNAMIC_RECENT_WINDOW_SEC
+                    ordered_candidates = sorted(
+                        same_size_candidates,
+                        key=lambda remote_path: float(local_map[remote_path].get("modified_time", 0.0)),
+                        reverse=True,
+                    )
+
+                    time_budget_for_signatures = max(0.0, compare_remaining_sec - SYNC_DYNAMIC_SIGNATURE_MARGIN_SEC)
+                    byte_budget_for_signatures = int(time_budget_for_signatures * SYNC_DYNAMIC_SIGNATURE_BYTES_PER_SEC)
+                    signature_candidates: list[str] = []
+                    signature_candidate_bytes = 0
+                    max_signature_files = max(1, SYNC_DYNAMIC_MAX_SIGNATURE_FILES)
+
+                    for remote_path in ordered_candidates:
+                        if len(signature_candidates) >= max_signature_files:
+                            break
+                        file_size = int(local_map[remote_path]["size_bytes"])
+                        if byte_budget_for_signatures <= 0:
+                            break
+                        if signature_candidate_bytes + file_size > byte_budget_for_signatures:
+                            continue
+                        signature_candidates.append(remote_path)
+                        signature_candidate_bytes += file_size
+
+                    signature_matches = set()
+                    unverified_paths = set(same_size_candidates) - set(signature_candidates)
+                    recent_unverified = {
+                        remote_path
+                        for remote_path in unverified_paths
+                        if float(local_map[remote_path].get("modified_time", 0.0)) >= recent_cutoff
+                    }
+                    size_fallback_paths = unverified_paths - recent_unverified
+
+                    if signature_candidates:
+                        report(
+                            f"Adaptive signature check: verifying {len(signature_candidates)} "
+                            f"of {len(same_size_candidates)} same-size file(s)"
+                        )
+                        local_signatures = {
+                            remote_path: _compute_local_file_signature(Path(local_map[remote_path]["local_path"]))
+                            for remote_path in signature_candidates
+                        }
+                        signature_estimated_sec = 5.0 + (
+                            signature_candidate_bytes / SYNC_DYNAMIC_SIGNATURE_BYTES_PER_SEC
+                        )
+                        signature_timeout = min(
+                            SYNC_SIGNATURE_SCAN_TIMEOUT_SEC,
+                            max(2.0, signature_estimated_sec),
+                        )
+                        try:
+                            remote_signatures = controller.sync_get_file_signatures(
+                                signature_candidates,
+                                timeout=signature_timeout,
+                            )
+                            unknown_signature_count = 0
+                            changed_same_size = 0
+                            for remote_path in signature_candidates:
+                                remote_signature = remote_signatures.get(remote_path)
+                                if remote_signature is None:
+                                    # Keep desktop-style behavior when signature data is unavailable.
+                                    signature_matches.add(remote_path)
+                                    unknown_signature_count += 1
+                                    continue
+                                if remote_signature == local_signatures[remote_path]:
+                                    signature_matches.add(remote_path)
+                                    continue
+                                changed_same_size += 1
+
+                            if changed_same_size:
+                                report(f"Signature check: {changed_same_size} same-size file(s) changed")
+                            if unknown_signature_count:
+                                report(
+                                    f"Signature check unavailable for {unknown_signature_count} same-size file(s). "
+                                    "Using size comparison for those file(s)."
+                                )
+                        except Exception as exc:
+                            signature_matches = None
+                            size_fallback_paths = None
+                            report(
+                                f"Signature verification unavailable ({exc}). "
+                                "Falling back to size comparison."
+                            )
+                    else:
+                        report(
+                            f"Adaptive signature check skipped for {len(same_size_candidates)} same-size file(s): "
+                            f"time budget exhausted (target {int(SYNC_FAST_COMPARE_TARGET_SEC)}s)."
+                        )
+
+                    if signature_matches is not None and recent_unverified:
+                        report(
+                            f"Adaptive safety: forcing upload for {len(recent_unverified)} "
+                            "recently modified same-size file(s)."
+                        )
+
+                unchanged, to_upload, to_delete, extra_remote = _build_sync_plan(
+                    files,
+                    remote_sizes,
+                    delete_extraneous=delete_extraneous,
+                    signature_matches=signature_matches,
+                    size_fallback_paths=size_fallback_paths,
+                )
+                if remote_scan_ok and not used_targeted_remote_scan and to_upload and len(to_upload) <= SYNC_TARGETED_VERIFY_MAX_FILES:
+                    if callable(targeted_probe):
+                        verify_paths = [str(file_info["remote_path"]) for file_info in to_upload]
+                        verify_timeout = min(
+                            SYNC_TARGETED_VERIFY_TIMEOUT_SEC,
+                            max(2.0, 1.0 + (len(verify_paths) * 0.05)),
+                        )
+                        try:
+                            probed_sizes = targeted_probe(verify_paths, timeout=verify_timeout)
+                            confirmed_present: list[str] = []
+                            filtered_uploads: list[dict[str, Any]] = []
+                            for file_info in to_upload:
+                                remote_path = str(file_info["remote_path"])
+                                local_size = int(file_info["size_bytes"])
+                                remote_size = probed_sizes.get(remote_path)
+                                if isinstance(remote_size, int) and remote_size == local_size:
+                                    confirmed_present.append(remote_path)
+                                    continue
+                                filtered_uploads.append(file_info)
+
+                            report(
+                                f"Direct verify: checked {len(verify_paths)} file(s), "
+                                f"confirmed {len(confirmed_present)} present."
+                            )
+                            if confirmed_present:
+                                unchanged.extend(sorted(confirmed_present))
+                                to_upload = filtered_uploads
+                                report(
+                                    f"Direct verify: {len(confirmed_present)} file(s) already present on device; "
+                                    "skipping re-upload."
+                                )
+                        except Exception as exc:
+                            report(f"Direct verify unavailable ({exc}). Continuing with planned uploads.")
+
+                unchanged_count = len(unchanged)
+
+                if to_upload:
+                    reason_counts: dict[str, int] = {}
+                    reason_samples: list[str] = []
+
+                    for file_info in to_upload:
+                        remote_path = str(file_info["remote_path"])
+                        local_size = int(file_info["size_bytes"])
+                        remote_size = remote_sizes.get(remote_path)
+
+                        if remote_size is None:
+                            reason = "missing-on-device"
+                        elif remote_size != local_size:
+                            reason = "size-mismatch"
+                        elif signature_matches is not None and size_fallback_paths is not None:
+                            if remote_path in signature_matches:
+                                reason = "matched-but-reupload"  # Defensive fallback; should be rare.
+                            elif remote_path in size_fallback_paths:
+                                reason = "size-fallback"
+                            else:
+                                reason = "adaptive-safety"
+                        elif signature_matches is not None:
+                            reason = "signature-mismatch"
+                        else:
+                            reason = "size-only"
+
+                        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                        if len(reason_samples) < 5:
+                            reason_samples.append(f"{remote_path} [{reason}]")
+
+                    report(
+                        "Change reasons: " + ", ".join(
+                            f"{count} {label}" for label, count in sorted(reason_counts.items())
+                        )
+                    )
+                    for sample in reason_samples:
+                        report(f"  {sample}")
+
+                report(
+                    f"Comparison: {len(to_upload)} changed/new, "
+                    f"{unchanged_count} unchanged, {len(files)} local total"
+                )
+                if delete_extraneous:
+                    report(f"Comparison: {len(to_delete)} stale remote file(s) will be deleted")
+                elif extra_remote:
+                    report(f"Comparison: keeping {len(extra_remote)} extra remote file(s) for upload-only sync")
+
+                deleted_count = 0
+                delete_failures: list[str] = []
+                if to_delete:
+                    report(f"Deleting {len(to_delete)} stale file(s)…")
+                    for index, remote_path in enumerate(to_delete, start=1):
+                        try:
+                            if controller.sync_delete_file(remote_path):
+                                deleted_count += 1
+                                report(f"[{index}/{len(to_delete)}] Deleted: {remote_path}")
+                            else:
+                                delete_failures.append(remote_path)
+                                report(f"[{index}/{len(to_delete)}] Failed: {remote_path}")
+                        except Exception as exc:
+                            delete_failures.append(remote_path)
+                            report(f"[{index}/{len(to_delete)}] Failed: {remote_path} ({exc})")
+
+                directory_failures: list[str] = []
+                if to_upload:
+                    required_dirs = _build_sync_directory_plan(remote_root, to_upload)
+                    device_dirs = [
+                        device_dir
+                        for device_dir in (_sync_device_relative_path(remote_dir) for remote_dir in required_dirs)
+                        if device_dir
+                    ]
+                    report("Creating folder structure…")
+                    for device_dir in device_dirs:
+                        try:
+                            if controller.sync_mkdir(device_dir):
+                                report(f"  + {device_dir}")
+                            else:
+                                directory_failures.append(device_dir)
+                                report(f"  ! {device_dir} (failed)")
+                        except Exception as exc:
+                            directory_failures.append(device_dir)
+                            report(f"  ! {device_dir} ({exc})")
+                    report("Folder structure synced ✓")
+
+                    synced_bytes = 0
+                    upload_failures: list[str] = []
+                    raw_upload_open = bool(getattr(controller, "_in_raw_repl", False))
+                    report(f"Uploading {len(to_upload)} file(s)…")
+
+                    try:
+                        for index, file_info in enumerate(sorted(to_upload, key=lambda item: str(item["remote_path"])), start=1):
+                            local_path = Path(file_info["local_path"])
+                            relative_path = str(file_info["relative_path"])
+                            remote_path = str(file_info["remote_path"])
+                            remote_write_path = _sync_device_relative_path(remote_path)
+                            file_size = int(file_info["size_bytes"])
+                            uploaded = False
+
+                            for attempt in range(SYNC_FILE_RETRY_COUNT):
+                                try:
+                                    if not raw_upload_open:
+                                        controller.sync_enter_raw_repl()
+                                        raw_upload_open = True
+                                    controller.sync_put_raw(local_path, remote_write_path)
+                                    synced_bytes += file_size
+                                    report(f"[{index}/{len(to_upload)}] Uploaded: {remote_path} ({file_size} bytes)")
+                                    uploaded = True
+                                    break
+                                except Exception as exc:
+                                    if raw_upload_open:
+                                        try:
+                                            controller.sync_exit_raw_repl()
+                                        except Exception:
+                                            pass
+                                        raw_upload_open = False
+                                    if attempt + 1 < SYNC_FILE_RETRY_COUNT:
+                                        retry_detail = ""
+                                        reconnect = getattr(controller, "sync_reconnect", None)
+                                        if callable(reconnect):
+                                            try:
+                                                reconnect()
+                                                retry_detail = " after connection reset"
+                                            except Exception as reconnect_exc:
+                                                retry_detail = f" after failed connection reset ({reconnect_exc})"
+                                        report(f"[{index}/{len(to_upload)}] Retry: {relative_path} ({exc}){retry_detail}")
+                                        time.sleep(SYNC_FILE_RETRY_DELAY_SEC)
+                                        continue
+                                    upload_failures.append(remote_path)
+                                    report(f"[{index}/{len(to_upload)}] Failed: {remote_path} ({exc})")
+
+                            if not uploaded:
+                                continue
+                    finally:
+                        if raw_upload_open:
+                            controller.sync_exit_raw_repl()
+                else:
+                    required_dirs = []
+                    synced_bytes = 0
+                    upload_failures = []
+                    if not to_delete:
+                        report("Everything is already in sync")
+
+                directory_warning_count = 0
+                if directory_failures and not upload_failures:
+                    directory_warning_count = len(directory_failures)
+                    report(
+                        f"Directory creation reported {directory_warning_count} issue(s), "
+                        "but uploads succeeded. Treating as warning."
+                    )
+                    directory_failures = []
+
+                ok = not upload_failures and not delete_failures and not directory_failures
+                error_summary = ""
+                if ok:
+                    report(
+                        f"Sync complete: {len(to_upload)} uploaded, {deleted_count} deleted, "
+                        f"{unchanged_count} skipped, {synced_bytes} bytes -> {remote_root}"
+                    )
+                else:
+                    error_summary = (
+                        f"Sync finished with {len(upload_failures)} upload failure(s), "
+                        f"{len(delete_failures)} delete failure(s), {len(directory_failures)} directory failure(s)."
+                    )
+                    report(error_summary)
+
+                payload = {
+                    "ok": ok,
+                    "port": controller.port,
+                    "localFolder": str(local_root),
+                    "remoteFolder": remote_root,
+                    "filesSynced": len(to_upload),
+                    "filesDeleted": deleted_count,
+                    "filesFailed": len(upload_failures),
+                    "filesSkipped": unchanged_count,
+                    "filesTotal": len(files),
+                    "directoriesEnsured": len(required_dirs),
+                    "directoriesFailed": len(directory_failures),
+                    "directoriesWarnings": directory_warning_count,
+                    "bytesSynced": synced_bytes,
+                    "error": error_summary or None,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "localFolder": str(local_root),
+                    "remoteFolder": directories[0],
+                    "error": str(exc),
+                }
+                recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                try:
+                    if bool(getattr(controller, "_in_raw_repl", False)):
+                        exit_raw = getattr(controller, "sync_exit_raw_repl", None)
+                        if callable(exit_raw):
+                            exit_raw()
+                except Exception:
+                    pass
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after folder sync"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
     def hybrid_snapshot(self) -> dict[str, Any]:
         with self._hybrid_lock:
             return {
@@ -1068,7 +2201,9 @@ class PersistentSession:
         with self._helper_condition:
             line_seq = self._helper_line_seq
             state_seq = self._helper_state_seq
+            was_suppressed = self._suppress_terminal_helper_output
             self._suppress_terminal_helper_output = True
+            self._suppress_terminal_helper_depth += 1
             self._suppress_terminal_helper_output_deadline = time.monotonic() + (
                 max(
                     HYBRID_HELPER_COMMAND_TIMEOUT_SEC,
@@ -1077,7 +2212,8 @@ class PersistentSession:
                 )
                 + 1.0
             )
-            self._suppress_terminal_helper_activity_seen = False
+            if not was_suppressed:
+                self._suppress_terminal_helper_activity_seen = False
 
         if mark_poll:
             with self._hybrid_lock:
@@ -1145,7 +2281,10 @@ class PersistentSession:
             suppress_helper_output = self._suppress_terminal_helper_output
             helper_activity_seen = self._suppress_terminal_helper_activity_seen
             if suppress_helper_output and time.monotonic() >= self._suppress_terminal_helper_output_deadline:
+                if _looks_like_helper_terminal_fragment(self._helper_line_buffer):
+                    self._helper_line_buffer = ""
                 self._suppress_terminal_helper_output = False
+                self._suppress_terminal_helper_depth = 0
                 self._suppress_terminal_helper_output_deadline = 0.0
                 self._suppress_terminal_helper_activity_seen = False
                 suppress_helper_output = False
@@ -1158,6 +2297,7 @@ class PersistentSession:
                     break
                 raw_line = self._helper_line_buffer[:newline]
                 self._helper_line_buffer = self._helper_line_buffer[newline + 1 :]
+                raw_line_is_helper_fragment = _looks_like_helper_terminal_fragment(raw_line)
                 cleaned = _clean_helper_line(raw_line)
                 if not cleaned:
                     if _is_prompt_only_fragment(raw_line):
@@ -1165,10 +2305,11 @@ class PersistentSession:
                             self._hybrid_pause_until_prompt = False
                     if started_suppressed and _is_prompt_only_fragment(raw_line):
                         if helper_activity_seen:
-                            self._suppress_terminal_helper_output = False
-                            self._suppress_terminal_helper_output_deadline = 0.0
-                            self._suppress_terminal_helper_activity_seen = False
-                            suppress_helper_output = False
+                            suppress_helper_output = self._consume_helper_prompt_locked()
+                            helper_activity_seen = self._suppress_terminal_helper_activity_seen
+                    elif started_suppressed and raw_line_is_helper_fragment:
+                        helper_activity_seen = True
+                        self._suppress_terminal_helper_activity_seen = True
                     elif started_suppressed and raw_line.strip():
                         visible_chunks.append(raw_line + "\n")
                     continue
@@ -1180,7 +2321,7 @@ class PersistentSession:
                 status_events.extend(status_payloads)
                 state_events.extend(state_payloads)
 
-                if suppress_helper_output and _looks_like_helper_terminal_line(cleaned):
+                if suppress_helper_output and (_looks_like_helper_terminal_line(cleaned) or raw_line_is_helper_fragment):
                     helper_activity_seen = True
                     self._suppress_terminal_helper_activity_seen = True
                     continue
@@ -1193,9 +2334,7 @@ class PersistentSession:
                 if suppress_helper_output:
                     self._helper_line_buffer = ""
                     if helper_activity_seen:
-                        self._suppress_terminal_helper_output = False
-                        self._suppress_terminal_helper_output_deadline = 0.0
-                        self._suppress_terminal_helper_activity_seen = False
+                        suppress_helper_output = self._consume_helper_prompt_locked()
 
             self._helper_condition.notify_all()
 
@@ -1273,6 +2412,17 @@ class PersistentSession:
             status_events.append(self._build_hybrid_status_event_payload(reason="updated"))
 
         return status_events, state_events
+
+    def _consume_helper_prompt_locked(self) -> bool:
+        if self._suppress_terminal_helper_depth > 0:
+            self._suppress_terminal_helper_depth -= 1
+        if self._suppress_terminal_helper_depth > 0:
+            return True
+        self._suppress_terminal_helper_output = False
+        self._suppress_terminal_helper_output_deadline = 0.0
+        self._suppress_terminal_helper_activity_seen = False
+        self._suppress_terminal_helper_depth = 0
+        return False
 
     def _run_helper_command_locked(self, command: str, timeout_seconds: float) -> dict[str, Any]:
         controller, pause_requested = self._begin_exclusive_operation()
@@ -1444,6 +2594,7 @@ class PersistentSession:
             self._helper_line_seq = 0
             self._helper_state_seq = 0
             self._suppress_terminal_helper_output = False
+            self._suppress_terminal_helper_depth = 0
             self._suppress_terminal_helper_output_deadline = 0.0
             self._suppress_terminal_helper_activity_seen = False
             self._hybrid_pause_until_prompt = False
@@ -1547,7 +2698,13 @@ class PersistentSession:
             raise ControllerError("No open CalSci session.")
 
         pause_requested.set()
-        paused_event.wait(timeout=READER_PAUSE_WAIT_SEC)
+        if not paused_event.wait(timeout=READER_PAUSE_WAIT_SEC):
+            pause_requested.clear()
+            raise ControllerError("Session reader did not pause in time.")
+
+        # Drop any buffered async output before running an exclusive command.
+        # This avoids mixing stale terminal traffic into raw REPL command output.
+        controller._drain_serial_input()
         return controller, pause_requested
 
     def _end_exclusive_operation(self, pause_requested: threading.Event) -> None:
@@ -1725,9 +2882,26 @@ class JobDispatcher:
                         local_file=str(args["localFile"]),
                         timeout_seconds=float(args.get("timeout", DEFAULT_RUN_TIMEOUT_SEC)),
                         cancel_event=cancel_event,
-                    )
+                        )
                 finally:
                     self._clear_active_run(job.request_id)
+            if job.command == "run-file-interactive":
+                return self._session.run_file_interactive(
+                    port=_optional_arg_string(args, "port"),
+                    local_file=str(args["localFile"]),
+                )
+            if job.command == "sync-folder":
+                return self._session.sync_folder(
+                    port=_optional_arg_string(args, "port"),
+                    local_folder=str(args["localFolder"]),
+                    remote_folder=str(args["remoteFolder"]),
+                    delete_extraneous=bool(args.get("deleteExtraneous", False)),
+                    progress_callback=(
+                        lambda line, req_id=job.request_id: _service_emit(
+                            {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
+                        )
+                    ) if job.stream else None,
+                )
             return {"ok": False, "error": f"Unsupported command: {job.command}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -1830,6 +3004,407 @@ def _load_local_text_file(local_file: str) -> tuple[Path, str]:
         return local_path, local_path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"File must be UTF-8 text: {exc}") from exc
+
+
+def _normalize_remote_folder(remote_folder: str) -> str:
+    return _sync_core.normalize_remote_folder(remote_folder)
+
+
+def _sync_device_relative_path(remote_path: str) -> str:
+    return _sync_core.sync_device_relative_path(remote_path)
+
+
+def _sync_device_absolute_path(remote_path: str) -> str:
+    return _sync_core.sync_device_absolute_path(remote_path)
+
+
+def _fnv1a32_bytes(data: bytes) -> str:
+    return _sync_core.fnv1a32_bytes(data)
+
+
+def _compute_local_file_signature(local_path: Path, chunk_size: int = 4096) -> str:
+    return _sync_core.compute_local_file_signature(local_path, chunk_size=chunk_size)
+
+
+def _should_skip_sync_dir(name: str) -> bool:
+    return _sync_core.should_skip_sync_dir(name)
+
+
+def _should_skip_sync_file(relative_path: Path) -> bool:
+    return _sync_core.should_skip_sync_file(relative_path)
+
+
+def _scan_local_folder(local_folder: str, remote_folder: str) -> tuple[Path, list[str], list[dict[str, Any]]]:
+    return _sync_core.scan_local_folder(local_folder, remote_folder)
+
+
+def _build_sync_directory_plan(remote_root: str, files: list[dict[str, Any]]) -> list[str]:
+    return _sync_core.build_sync_directory_plan(remote_root, files)
+
+
+def _build_sync_plan(
+    files: list[dict[str, Any]],
+    remote_sizes: dict[str, int],
+    delete_extraneous: bool,
+    signature_matches: set[str] | None = None,
+    size_fallback_paths: set[str] | None = None,
+) -> tuple[list[str], list[dict[str, Any]], list[str], list[str]]:
+    return _sync_core.build_sync_plan(
+        files,
+        remote_sizes,
+        delete_extraneous,
+        signature_matches=signature_matches,
+        size_fallback_paths=size_fallback_paths,
+    )
+
+
+def _device_mkdir_script(remote_dir: str) -> str:
+    return _sync_scripts.device_mkdir_script(remote_dir)
+
+
+def _device_delete_file_script(remote_file: str) -> str:
+    return _sync_scripts.device_delete_file_script(remote_file)
+
+
+def _device_list_file_sizes_script(remote_root: str) -> str:
+    return _sync_scripts.device_list_file_sizes_script(remote_root)
+
+
+def _device_list_file_sizes_stream_script(remote_root: str) -> str:
+    return _sync_scripts.device_list_file_sizes_stream_script(remote_root)
+
+
+def _device_list_file_signatures_script(remote_paths: list[str]) -> str:
+    return _sync_scripts.device_list_file_signatures_script(remote_paths)
+
+
+def _device_list_file_signatures_stream_script(remote_paths: list[str]) -> str:
+    return _sync_scripts.device_list_file_signatures_stream_script(remote_paths)
+
+
+def _device_selected_file_sizes_script(remote_paths: list[str]) -> str:
+    return _sync_scripts.device_selected_file_sizes_script(remote_paths)
+
+
+def _device_selected_file_sizes_stream_script(remote_paths: list[str]) -> str:
+    return _sync_scripts.device_selected_file_sizes_stream_script(remote_paths)
+
+
+def _device_put_file_script(remote_file: str, data: bytes) -> str:
+    return _sync_scripts.device_put_file_script(remote_file, data, chunk_bytes=SYNC_FILE_SCRIPT_CHUNK_BYTES)
+
+
+def _estimate_sync_source_timeout(source: str, minimum_seconds: float = SYNC_DEVICE_COMMAND_TIMEOUT_SEC) -> float:
+    return _sync_scripts.estimate_sync_source_timeout(source, minimum_seconds=minimum_seconds)
+
+
+def _exec_sync_script(
+    controller: CalSciController,
+    source: str,
+    timeout_seconds: float = SYNC_DEVICE_COMMAND_TIMEOUT_SEC,
+    keep_raw_repl: bool = False,
+) -> str:
+    if keep_raw_repl:
+        stdout_bytes, stderr_bytes = controller.exec_source_in_raw_repl(source, timeout_seconds)
+    else:
+        stdout_bytes, stderr_bytes = controller.exec_source(source, timeout_seconds)
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+    if stderr_text:
+        raise ControllerError(stderr_text)
+    return stdout_bytes.decode("utf-8", errors="replace")
+
+
+def _parse_device_sizes_output(output: str) -> dict[str, int]:
+    marker = "SIZES:"
+    start = output.find(marker)
+    if start < 0:
+        snippet = output.strip()
+        if not snippet:
+            raise ControllerError("Device size scan returned no output.")
+        raise ControllerError(f"Device size scan marker missing in output: {snippet[:200]}")
+
+    start += len(marker)
+    depth = 0
+    end = start
+    for index in range(start, len(output)):
+        char = output[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+
+    payload = output[start:end].strip()
+    if not payload:
+        return {}
+
+    parsed = ast.literal_eval(payload)
+    if not isinstance(parsed, dict):
+        raise ControllerError("Device size scan returned an invalid payload.")
+
+    result: dict[str, int] = {}
+    for remote_path, file_size in parsed.items():
+        result[str(remote_path)] = int(file_size)
+    return result
+
+
+def _parse_device_sizes_stream_output(output: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    done_seen = False
+
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "SIZE_SCAN_DONE":
+            done_seen = True
+            continue
+        if not line.startswith("SIZE:"):
+            continue
+
+        payload = line[len("SIZE:") :]
+        split_index = payload.rfind(":")
+        if split_index <= 0:
+            continue
+        remote_path = payload[:split_index]
+        size_text = payload[split_index + 1 :]
+        try:
+            result[remote_path] = int(size_text)
+        except Exception:
+            continue
+
+    if result or done_seen:
+        return result
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError("Device size scan stream returned no output.")
+    raise ControllerError(f"Device size scan stream produced no SIZE rows: {snippet[:200]}")
+
+
+def _parse_device_signatures_output(output: str) -> dict[str, str | None]:
+    marker = "SIGS:"
+    start = output.find(marker)
+    if start < 0:
+        snippet = output.strip()
+        if not snippet:
+            raise ControllerError("Device signature scan returned no output.")
+        raise ControllerError(f"Device signature scan marker missing in output: {snippet[:200]}")
+
+    start += len(marker)
+    depth = 0
+    end = start
+    for index in range(start, len(output)):
+        char = output[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+
+    payload = output[start:end].strip()
+    if not payload:
+        return {}
+
+    parsed = ast.literal_eval(payload)
+    if not isinstance(parsed, dict):
+        raise ControllerError("Device signature scan returned an invalid payload.")
+
+    result: dict[str, str | None] = {}
+    for remote_path, signature in parsed.items():
+        result[str(remote_path)] = None if signature is None else str(signature)
+    return result
+
+
+def _parse_device_signatures_stream_output(output: str) -> dict[str, str | None]:
+    result: dict[str, str | None] = {}
+    done_seen = False
+
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "SIG_SCAN_DONE":
+            done_seen = True
+            continue
+        if not line.startswith("SIG:"):
+            continue
+
+        payload = line[len("SIG:") :]
+        length_sep = payload.find(":")
+        if length_sep <= 0:
+            continue
+        try:
+            path_length = int(payload[:length_sep])
+        except Exception:
+            continue
+        if path_length < 0:
+            continue
+
+        remainder = payload[length_sep + 1 :]
+        minimum_remainder_length = path_length + 3
+        if len(remainder) < minimum_remainder_length:
+            continue
+
+        remote_path = remainder[:path_length]
+        if len(remainder) <= path_length or remainder[path_length] != ":":
+            continue
+
+        flag_and_value = remainder[path_length + 1 :]
+        flag_sep = flag_and_value.find(":")
+        if flag_sep < 0:
+            continue
+        flag = flag_and_value[:flag_sep]
+        signature = flag_and_value[flag_sep + 1 :]
+
+        if flag == "0":
+            result[remote_path] = None
+        elif flag == "1":
+            result[remote_path] = signature
+
+    if result or done_seen:
+        return result
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError("Device signature scan stream returned no output.")
+    raise ControllerError(f"Device signature scan stream produced no SIG rows: {snippet[:200]}")
+
+
+def _parse_device_selected_sizes_output(output: str) -> dict[str, int | None]:
+    marker = "PATH_SIZES:"
+    start = output.find(marker)
+    if start < 0:
+        snippet = output.strip()
+        if not snippet:
+            raise ControllerError("Device targeted size scan returned no output.")
+        raise ControllerError(f"Device targeted size scan marker missing in output: {snippet[:200]}")
+
+    start += len(marker)
+    depth = 0
+    end = start
+    for index in range(start, len(output)):
+        char = output[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+
+    payload = output[start:end].strip()
+    if not payload:
+        return {}
+
+    parsed = ast.literal_eval(payload)
+    if not isinstance(parsed, dict):
+        raise ControllerError("Device targeted size scan returned an invalid payload.")
+
+    result: dict[str, int | None] = {}
+    for remote_path, file_size in parsed.items():
+        if file_size is None:
+            result[str(remote_path)] = None
+        else:
+            result[str(remote_path)] = int(file_size)
+    return result
+
+
+def _parse_device_selected_sizes_stream_output(output: str) -> dict[str, int | None]:
+    result: dict[str, int | None] = {}
+    done_seen = False
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "PATH_SIZE_SCAN_DONE":
+            done_seen = True
+            continue
+        if not line.startswith("PATHSIZE:"):
+            continue
+
+        payload = line[len("PATHSIZE:") :]
+        length_sep = payload.find(":")
+        if length_sep <= 0:
+            continue
+        try:
+            path_length = int(payload[:length_sep])
+        except Exception:
+            continue
+        if path_length < 0:
+            continue
+
+        remainder = payload[length_sep + 1 :]
+        minimum_remainder_length = path_length + 3
+        if len(remainder) < minimum_remainder_length:
+            continue
+
+        remote_path = remainder[:path_length]
+        if len(remainder) <= path_length or remainder[path_length] != ":":
+            continue
+
+        flag_and_size = remainder[path_length + 1 :]
+        flag_sep = flag_and_size.find(":")
+        if flag_sep < 0:
+            continue
+        flag = flag_and_size[:flag_sep]
+        size_text = flag_and_size[flag_sep + 1 :]
+
+        if flag == "0":
+            result[remote_path] = None
+            continue
+        if flag == "1":
+            try:
+                result[remote_path] = int(size_text)
+            except Exception:
+                continue
+
+    if result or done_seen:
+        return result
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError("Device targeted size scan stream returned no output.")
+    raise ControllerError(f"Device targeted size scan stream produced no PATHSIZE rows: {snippet[:200]}")
+
+
+def _chunk_remote_paths_for_targeted_scan(
+    remote_paths: list[str],
+    max_batch_size: int = SYNC_TARGETED_SCAN_BATCH_SIZE,
+    max_script_chars: int = SYNC_TARGETED_SCAN_MAX_SCRIPT_CHARS,
+) -> list[list[str]]:
+    if not remote_paths:
+        return []
+
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    for remote_path in remote_paths:
+        candidate = current_batch + [remote_path]
+        estimated_script_chars = len(_device_selected_file_sizes_script(candidate))
+        if current_batch and (
+            len(candidate) > max_batch_size or estimated_script_chars > max_script_chars
+        ):
+            batches.append(current_batch)
+            current_batch = [remote_path]
+            continue
+        current_batch = candidate
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
+def _is_raw_stdout_timeout(exc: Exception) -> bool:
+    return "waiting for raw REPL stdout terminator" in str(exc)
+
+
+def _read_remote_file_sizes(controller: CalSciController, remote_root: str) -> dict[str, int]:
+    return controller.sync_get_file_sizes(remote_root, timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC)
 
 
 def run_soft_reset(port: str, timeout_seconds: float) -> dict[str, Any]:

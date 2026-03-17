@@ -25,7 +25,8 @@ This keeps risk low and preserves the current extension V1 commands during the m
 - Extend the VS Code extension from per-command open/close into a long-lived backend session owner.
 - Keep existing commands working through that session:
   - `Select Device`
-  - `Run Current File`
+  - `Run Non-Interactive File`
+  - `Run Interactive File`
   - `Soft Reset Device`
 - Add an in-extension REPL terminal using a VS Code `Pseudoterminal` backed by the Python backend service.
 - Make the backend the single reader/writer for the serial port.
@@ -40,7 +41,7 @@ This keeps risk low and preserves the current extension V1 commands during the m
 
 ### Remaining Step 1 Stability Note
 
-- One concept is still tracked after Step 1 verification: repeated raw REPL crossings between `CalSci Run` and the normal REPL can still push the device/runtime into a "dirty" state over time.
+- One concept is still tracked after Step 1 verification: repeated raw REPL crossings between the non-interactive run path and the normal REPL can still push the device/runtime into a "dirty" state over time.
 - Treat this as a device/runtime stability concern, not as a blocker for Step 1 acceptance.
 - Practical meaning:
   - Step 1 is achieved.
