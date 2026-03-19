@@ -679,7 +679,7 @@ class SyncFolderTests(unittest.TestCase):
         self.assertEqual(sizes, {"/main.py": 12})
         self.assertEqual(controller.calls, [("/", backend.SYNC_SCAN_COMMAND_TIMEOUT_SEC)])
 
-    def test_sync_folder_signature_failure_falls_back_to_size_compare(self) -> None:
+    def test_sync_folder_same_size_file_is_skipped_by_size_scan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             file_path = root / "main.py"
@@ -692,9 +692,6 @@ class SyncFolderTests(unittest.TestCase):
 
                 def sync_get_file_sizes(self, remote_root: str, timeout: float = 0.0) -> dict[str, int]:
                     return {"/main.py": size_bytes}
-
-                def sync_get_file_signatures(self, remote_paths: list[str], timeout: float = 0.0) -> dict[str, str | None]:
-                    raise backend.ControllerError("signature unavailable")
 
                 def sync_delete_file(self, path: str) -> bool:
                     raise AssertionError("delete should not run when nothing changed")
@@ -721,16 +718,16 @@ class SyncFolderTests(unittest.TestCase):
                 port=None,
                 local_folder=str(root),
                 remote_folder="/",
-                delete_extraneous=False,
+                delete_extraneous=True,
                 progress_callback=progress_lines.append,
             )
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["filesSynced"], 0)
             self.assertEqual(result["filesSkipped"], 1)
-            self.assertIn("Falling back to size comparison.", "\n".join(progress_lines))
+            self.assertIn("Unchanged : 1 file(s)", "\n".join(progress_lines))
 
-    def test_sync_folder_direct_verify_skips_false_positive_reupload(self) -> None:
+    def test_sync_folder_delete_extraneous_removes_stale_remote_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             file_path = root / "main.py"
@@ -740,31 +737,23 @@ class SyncFolderTests(unittest.TestCase):
             class FakeController:
                 def __init__(self) -> None:
                     self.port = "COM_TEST"
-                    self.targeted_calls: list[list[str]] = []
-                    self.raw_enter_calls = 0
+                    self.deleted_paths: list[str] = []
 
                 def sync_get_file_sizes(self, remote_root: str, timeout: float = 0.0) -> dict[str, int]:
-                    return {}
-
-                def sync_get_selected_file_sizes(
-                    self,
-                    remote_paths: list[str],
-                    timeout: float = 0.0,
-                ) -> dict[str, int | None]:
-                    self.targeted_calls.append(list(remote_paths))
-                    return {"/main.py": size_bytes}
+                    return {
+                        "/main.py": size_bytes,
+                        "/old.py": 3,
+                    }
 
                 def sync_delete_file(self, path: str) -> bool:
-                    raise AssertionError("delete should not run for upload-only sync")
+                    self.deleted_paths.append(path)
+                    return True
 
                 def sync_mkdir(self, path: str) -> bool:
-                    raise AssertionError("mkdir should not run when upload is skipped")
-
-                def sync_enter_raw_repl(self) -> None:
-                    self.raw_enter_calls += 1
+                    raise AssertionError("mkdir should not run when nothing changed")
 
                 def sync_put_raw(self, local_path: pathlib.Path, remote_path: str) -> None:
-                    raise AssertionError("upload should be skipped after direct verify")
+                    raise AssertionError("upload should not run when only stale files are deleted")
 
                 def sync_exit_raw_repl(self) -> None:
                     pass
@@ -779,19 +768,18 @@ class SyncFolderTests(unittest.TestCase):
                 port=None,
                 local_folder=str(root),
                 remote_folder="/",
-                delete_extraneous=False,
+                delete_extraneous=True,
                 progress_callback=progress_lines.append,
             )
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["filesSynced"], 0)
             self.assertEqual(result["filesSkipped"], 1)
-            self.assertEqual(controller.targeted_calls, [["/main.py"]])
-            self.assertEqual(controller.raw_enter_calls, 0)
-            self.assertIn("Direct verify: checked 1 file(s), confirmed 1 present.", "\n".join(progress_lines))
-            self.assertIn("Direct verify: 1 file(s) already present on device; skipping re-upload.", "\n".join(progress_lines))
+            self.assertEqual(result["filesDeleted"], 1)
+            self.assertEqual(controller.deleted_paths, ["/old.py"])
+            self.assertIn("Deleting 1 stale file(s)…", "\n".join(progress_lines))
 
-    def test_sync_folder_upload_only_uses_fast_targeted_scan_for_large_folder(self) -> None:
+    def test_sync_folder_size_scan_uploads_only_missing_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             local_sizes: dict[str, int] = {}
@@ -804,30 +792,19 @@ class SyncFolderTests(unittest.TestCase):
             class FakeController:
                 def __init__(self) -> None:
                     self.port = "COM_TEST"
-                    self.targeted_calls = 0
-                    self.full_scan_calls = 0
+                    self.scan_calls = 0
                     self.upload_calls: list[str] = []
 
-                def sync_get_selected_file_sizes(
-                    self,
-                    remote_paths: list[str],
-                    timeout: float = 0.0,
-                ) -> dict[str, int | None]:
-                    self.targeted_calls += 1
+                def sync_get_file_sizes(self, remote_root: str, timeout: float = 0.0) -> dict[str, int]:
+                    self.scan_calls += 1
                     return {
-                        remote_path: (None if remote_path == missing_path else local_sizes[remote_path])
-                        for remote_path in remote_paths
+                        remote_path: size
+                        for remote_path, size in local_sizes.items()
+                        if remote_path != missing_path
                     }
 
-                def sync_get_file_sizes(self, remote_root: str, timeout: float = 0.0) -> dict[str, int]:
-                    self.full_scan_calls += 1
-                    raise AssertionError("full subtree scan should not run in upload-only fast scan mode")
-
-                def sync_get_file_signatures(self, remote_paths: list[str], timeout: float = 0.0) -> dict[str, str | None]:
-                    return {}
-
                 def sync_delete_file(self, path: str) -> bool:
-                    raise AssertionError("delete should not run for upload-only sync")
+                    raise AssertionError("delete should not run when remote has no extra files")
 
                 def sync_mkdir(self, path: str) -> bool:
                     return True
@@ -851,18 +828,16 @@ class SyncFolderTests(unittest.TestCase):
                 port=None,
                 local_folder=str(root),
                 remote_folder="/",
-                delete_extraneous=False,
+                delete_extraneous=True,
                 progress_callback=progress_lines.append,
             )
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["filesSynced"], 1)
             self.assertEqual(result["filesSkipped"], 39)
-            self.assertEqual(controller.targeted_calls, 1)
-            self.assertEqual(controller.full_scan_calls, 0)
+            self.assertEqual(controller.scan_calls, 1)
             self.assertEqual(controller.upload_calls, ["f39.py"])
-            self.assertIn("Upload-only fast scan: found 39 existing file(s), 1 missing.", "\n".join(progress_lines))
-            self.assertNotIn("Direct verify:", "\n".join(progress_lines))
+            self.assertIn("To upload : 1 file(s)", "\n".join(progress_lines))
 
     def test_sync_folder_uploads_with_relative_device_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

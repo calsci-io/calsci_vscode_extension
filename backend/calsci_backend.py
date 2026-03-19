@@ -1707,297 +1707,52 @@ class PersistentSession:
                     pass
 
                 remote_root = directories[0]
-                compare_started_at = time.monotonic()
                 report(f"Scanning {remote_root} on device…")
-                remote_scan_ok = False
-                remote_scan_error: Exception | None = None
                 remote_sizes: dict[str, int] = {}
-                local_map = {str(file_info["remote_path"]): file_info for file_info in files}
-                used_targeted_remote_scan = False
-                targeted_probe = getattr(controller, "sync_get_selected_file_sizes", None)
-                should_try_targeted_scan = (
-                    not delete_extraneous
-                    and callable(targeted_probe)
-                    and SYNC_UPLOAD_ONLY_FAST_SCAN_MIN_FILES <= len(local_map) <= SYNC_UPLOAD_ONLY_FAST_SCAN_MAX_FILES
-                )
+                remote_scan_error: Exception | None = None
 
-                if should_try_targeted_scan:
-                    target_paths = sorted(local_map.keys())
-                    targeted_timeout = min(
-                        SYNC_SCAN_COMMAND_TIMEOUT_SEC,
-                        max(3.0, 1.5 + (len(target_paths) * 0.03)),
-                    )
-                    for attempt in range(2):
-                        try:
-                            selected_sizes = targeted_probe(target_paths, timeout=targeted_timeout)
-                            remote_sizes = {
-                                remote_path: int(file_size)
-                                for remote_path, file_size in selected_sizes.items()
-                                if isinstance(file_size, int)
-                            }
-                            remote_scan_ok = True
-                            remote_scan_error = None
-                            used_targeted_remote_scan = True
-                            missing_count = max(0, len(target_paths) - len(remote_sizes))
-                            report(
-                                f"Upload-only fast scan: found {len(remote_sizes)} existing file(s), "
-                                f"{missing_count} missing."
-                            )
-                            break
-                        except ControllerError as exc:
-                            remote_scan_error = exc
-                            if attempt == 0:
-                                scan_recovery = _recover_after_run_failure(controller)
-                                if scan_recovery.get("output"):
-                                    self._emit_terminal_text(str(scan_recovery["output"]))
-                                if not scan_recovery.get("ok"):
-                                    restore_error = scan_recovery.get("error") or "Unknown recovery failure"
-                                    raise ControllerError(f"{exc} | scan recovery failed: {restore_error}") from exc
-                                report(f"Upload-only fast scan failed ({exc}). Retrying after REPL recovery…")
-                                continue
-                            break
-                        except Exception as exc:
-                            remote_scan_error = exc
-                            if attempt == 0:
-                                report(f"Upload-only fast scan unavailable ({exc}). Retrying once…")
-                                continue
-                            break
-
-                    if not remote_scan_ok and remote_scan_error is not None:
-                        report(
-                            f"Upload-only fast scan failed ({remote_scan_error}). "
-                            "Falling back to subtree scan…"
-                        )
-
-                if not remote_scan_ok:
-                    for attempt in range(2):
-                        try:
-                            remote_sizes = controller.sync_get_file_sizes(
-                                remote_root,
-                                timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC,
-                            )
-                            report(f"Remote subtree has {len(remote_sizes)} file(s)")
-                            remote_scan_ok = True
-                            remote_scan_error = None
-                            break
-                        except ControllerError as exc:
-                            remote_scan_error = exc
-                            if attempt == 0:
-                                scan_recovery = _recover_after_run_failure(controller)
-                                if scan_recovery.get("output"):
-                                    self._emit_terminal_text(str(scan_recovery["output"]))
-                                if not scan_recovery.get("ok"):
-                                    restore_error = scan_recovery.get("error") or "Unknown recovery failure"
-                                    raise ControllerError(f"{exc} | scan recovery failed: {restore_error}") from exc
-                                report(f"Remote scan failed ({exc}). Retrying after REPL recovery…")
-                                continue
-                            break
-                        except Exception as exc:
-                            remote_scan_error = exc
-                            if attempt == 0:
-                                report(f"Remote scan unavailable ({exc}). Retrying once…")
-                                continue
-                            break
-
-                if not remote_scan_ok:
-                    report(f"Remote scan failed ({remote_scan_error}). Falling back to full upload.")
-                if remote_scan_ok and not remote_sizes and local_map:
-                    if used_targeted_remote_scan:
-                        report("Device scan found no matching local file(s). Full upload required.")
-                    else:
-                        report("Remote subtree is empty. Full upload required.")
-                same_size_candidates = [
-                    remote_path
-                    for remote_path, file_info in sorted(local_map.items())
-                    if remote_sizes.get(remote_path) == int(file_info["size_bytes"])
-                ]
-                signature_matches: set[str] | None = None
-                size_fallback_paths: set[str] | None = None
-                if same_size_candidates:
-                    compare_elapsed_sec = time.monotonic() - compare_started_at
-                    compare_remaining_sec = max(0.0, SYNC_FAST_COMPARE_TARGET_SEC - compare_elapsed_sec)
-                    recent_cutoff = time.time() - SYNC_DYNAMIC_RECENT_WINDOW_SEC
-                    ordered_candidates = sorted(
-                        same_size_candidates,
-                        key=lambda remote_path: float(local_map[remote_path].get("modified_time", 0.0)),
-                        reverse=True,
-                    )
-
-                    time_budget_for_signatures = max(0.0, compare_remaining_sec - SYNC_DYNAMIC_SIGNATURE_MARGIN_SEC)
-                    byte_budget_for_signatures = int(time_budget_for_signatures * SYNC_DYNAMIC_SIGNATURE_BYTES_PER_SEC)
-                    signature_candidates: list[str] = []
-                    signature_candidate_bytes = 0
-                    max_signature_files = max(1, SYNC_DYNAMIC_MAX_SIGNATURE_FILES)
-
-                    for remote_path in ordered_candidates:
-                        if len(signature_candidates) >= max_signature_files:
-                            break
-                        file_size = int(local_map[remote_path]["size_bytes"])
-                        if byte_budget_for_signatures <= 0:
-                            break
-                        if signature_candidate_bytes + file_size > byte_budget_for_signatures:
+                for attempt in range(2):
+                    try:
+                        remote_sizes = _read_remote_file_sizes(controller, remote_root)
+                        report(f"CalSci has {len(remote_sizes)} file(s)")
+                        remote_scan_error = None
+                        break
+                    except ControllerError as exc:
+                        remote_scan_error = exc
+                        if attempt == 0:
+                            scan_recovery = _recover_after_run_failure(controller)
+                            if scan_recovery.get("output"):
+                                self._emit_terminal_text(str(scan_recovery["output"]))
+                            if not scan_recovery.get("ok"):
+                                restore_error = scan_recovery.get("error") or "Unknown recovery failure"
+                                raise ControllerError(f"{exc} | scan recovery failed: {restore_error}") from exc
+                            report(f"Remote scan failed ({exc}). Retrying after REPL recovery…")
                             continue
-                        signature_candidates.append(remote_path)
-                        signature_candidate_bytes += file_size
+                        break
+                    except Exception as exc:
+                        remote_scan_error = exc
+                        if attempt == 0:
+                            report(f"Remote scan unavailable ({exc}). Retrying once…")
+                            continue
+                        break
 
-                    signature_matches = set()
-                    unverified_paths = set(same_size_candidates) - set(signature_candidates)
-                    recent_unverified = {
-                        remote_path
-                        for remote_path in unverified_paths
-                        if float(local_map[remote_path].get("modified_time", 0.0)) >= recent_cutoff
-                    }
-                    size_fallback_paths = unverified_paths - recent_unverified
-
-                    if signature_candidates:
-                        report(
-                            f"Adaptive signature check: verifying {len(signature_candidates)} "
-                            f"of {len(same_size_candidates)} same-size file(s)"
-                        )
-                        local_signatures = {
-                            remote_path: _compute_local_file_signature(Path(local_map[remote_path]["local_path"]))
-                            for remote_path in signature_candidates
-                        }
-                        signature_estimated_sec = 5.0 + (
-                            signature_candidate_bytes / SYNC_DYNAMIC_SIGNATURE_BYTES_PER_SEC
-                        )
-                        signature_timeout = min(
-                            SYNC_SIGNATURE_SCAN_TIMEOUT_SEC,
-                            max(2.0, signature_estimated_sec),
-                        )
-                        try:
-                            remote_signatures = controller.sync_get_file_signatures(
-                                signature_candidates,
-                                timeout=signature_timeout,
-                            )
-                            unknown_signature_count = 0
-                            changed_same_size = 0
-                            for remote_path in signature_candidates:
-                                remote_signature = remote_signatures.get(remote_path)
-                                if remote_signature is None:
-                                    # Keep desktop-style behavior when signature data is unavailable.
-                                    signature_matches.add(remote_path)
-                                    unknown_signature_count += 1
-                                    continue
-                                if remote_signature == local_signatures[remote_path]:
-                                    signature_matches.add(remote_path)
-                                    continue
-                                changed_same_size += 1
-
-                            if changed_same_size:
-                                report(f"Signature check: {changed_same_size} same-size file(s) changed")
-                            if unknown_signature_count:
-                                report(
-                                    f"Signature check unavailable for {unknown_signature_count} same-size file(s). "
-                                    "Using size comparison for those file(s)."
-                                )
-                        except Exception as exc:
-                            signature_matches = None
-                            size_fallback_paths = None
-                            report(
-                                f"Signature verification unavailable ({exc}). "
-                                "Falling back to size comparison."
-                            )
-                    else:
-                        report(
-                            f"Adaptive signature check skipped for {len(same_size_candidates)} same-size file(s): "
-                            f"time budget exhausted (target {int(SYNC_FAST_COMPARE_TARGET_SEC)}s)."
-                        )
-
-                    if signature_matches is not None and recent_unverified:
-                        report(
-                            f"Adaptive safety: forcing upload for {len(recent_unverified)} "
-                            "recently modified same-size file(s)."
-                        )
+                if remote_scan_error is not None:
+                    raise remote_scan_error
 
                 unchanged, to_upload, to_delete, extra_remote = _build_sync_plan(
                     files,
                     remote_sizes,
                     delete_extraneous=delete_extraneous,
-                    signature_matches=signature_matches,
-                    size_fallback_paths=size_fallback_paths,
                 )
-                if remote_scan_ok and not used_targeted_remote_scan and to_upload and len(to_upload) <= SYNC_TARGETED_VERIFY_MAX_FILES:
-                    if callable(targeted_probe):
-                        verify_paths = [str(file_info["remote_path"]) for file_info in to_upload]
-                        verify_timeout = min(
-                            SYNC_TARGETED_VERIFY_TIMEOUT_SEC,
-                            max(2.0, 1.0 + (len(verify_paths) * 0.05)),
-                        )
-                        try:
-                            probed_sizes = targeted_probe(verify_paths, timeout=verify_timeout)
-                            confirmed_present: list[str] = []
-                            filtered_uploads: list[dict[str, Any]] = []
-                            for file_info in to_upload:
-                                remote_path = str(file_info["remote_path"])
-                                local_size = int(file_info["size_bytes"])
-                                remote_size = probed_sizes.get(remote_path)
-                                if isinstance(remote_size, int) and remote_size == local_size:
-                                    confirmed_present.append(remote_path)
-                                    continue
-                                filtered_uploads.append(file_info)
-
-                            report(
-                                f"Direct verify: checked {len(verify_paths)} file(s), "
-                                f"confirmed {len(confirmed_present)} present."
-                            )
-                            if confirmed_present:
-                                unchanged.extend(sorted(confirmed_present))
-                                to_upload = filtered_uploads
-                                report(
-                                    f"Direct verify: {len(confirmed_present)} file(s) already present on device; "
-                                    "skipping re-upload."
-                                )
-                        except Exception as exc:
-                            report(f"Direct verify unavailable ({exc}). Continuing with planned uploads.")
-
                 unchanged_count = len(unchanged)
 
-                if to_upload:
-                    reason_counts: dict[str, int] = {}
-                    reason_samples: list[str] = []
-
-                    for file_info in to_upload:
-                        remote_path = str(file_info["remote_path"])
-                        local_size = int(file_info["size_bytes"])
-                        remote_size = remote_sizes.get(remote_path)
-
-                        if remote_size is None:
-                            reason = "missing-on-device"
-                        elif remote_size != local_size:
-                            reason = "size-mismatch"
-                        elif signature_matches is not None and size_fallback_paths is not None:
-                            if remote_path in signature_matches:
-                                reason = "matched-but-reupload"  # Defensive fallback; should be rare.
-                            elif remote_path in size_fallback_paths:
-                                reason = "size-fallback"
-                            else:
-                                reason = "adaptive-safety"
-                        elif signature_matches is not None:
-                            reason = "signature-mismatch"
-                        else:
-                            reason = "size-only"
-
-                        reason_counts[reason] = reason_counts.get(reason, 0) + 1
-                        if len(reason_samples) < 5:
-                            reason_samples.append(f"{remote_path} [{reason}]")
-
-                    report(
-                        "Change reasons: " + ", ".join(
-                            f"{count} {label}" for label, count in sorted(reason_counts.items())
-                        )
-                    )
-                    for sample in reason_samples:
-                        report(f"  {sample}")
-
-                report(
-                    f"Comparison: {len(to_upload)} changed/new, "
-                    f"{unchanged_count} unchanged, {len(files)} local total"
-                )
-                if delete_extraneous:
-                    report(f"Comparison: {len(to_delete)} stale remote file(s) will be deleted")
-                elif extra_remote:
-                    report(f"Comparison: keeping {len(extra_remote)} extra remote file(s) for upload-only sync")
+                report("─── Sync comparison ───")
+                report(f"  Unchanged : {unchanged_count} file(s)")
+                report(f"  To upload : {len(to_upload)} file(s)")
+                report(f"  To delete : {len(to_delete)} file(s)")
+                if not delete_extraneous and extra_remote:
+                    report(f"  Extra remote kept : {len(extra_remote)} file(s)")
+                report("───────────────────────")
 
                 deleted_count = 0
                 delete_failures: list[str] = []
@@ -2037,6 +1792,7 @@ class PersistentSession:
                     report("Folder structure synced ✓")
 
                     synced_bytes = 0
+                    uploaded_count = 0
                     upload_failures: list[str] = []
                     raw_upload_open = bool(getattr(controller, "_in_raw_repl", False))
                     report(f"Uploading {len(to_upload)} file(s)…")
@@ -2057,6 +1813,7 @@ class PersistentSession:
                                         raw_upload_open = True
                                     controller.sync_put_raw(local_path, remote_write_path)
                                     synced_bytes += file_size
+                                    uploaded_count += 1
                                     report(f"[{index}/{len(to_upload)}] Uploaded: {remote_path} ({file_size} bytes)")
                                     uploaded = True
                                     break
@@ -2090,6 +1847,7 @@ class PersistentSession:
                 else:
                     required_dirs = []
                     synced_bytes = 0
+                    uploaded_count = 0
                     upload_failures = []
                     if not to_delete:
                         report("Everything is already in sync")
@@ -2107,7 +1865,7 @@ class PersistentSession:
                 error_summary = ""
                 if ok:
                     report(
-                        f"Sync complete: {len(to_upload)} uploaded, {deleted_count} deleted, "
+                        f"Sync complete: {uploaded_count} uploaded, {deleted_count} deleted, "
                         f"{unchanged_count} skipped, {synced_bytes} bytes -> {remote_root}"
                     )
                 else:
@@ -2122,7 +1880,7 @@ class PersistentSession:
                     "port": controller.port,
                     "localFolder": str(local_root),
                     "remoteFolder": remote_root,
-                    "filesSynced": len(to_upload),
+                    "filesSynced": uploaded_count,
                     "filesDeleted": deleted_count,
                     "filesFailed": len(upload_failures),
                     "filesSkipped": unchanged_count,

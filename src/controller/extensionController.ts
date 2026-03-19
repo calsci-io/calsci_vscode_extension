@@ -930,7 +930,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     return {
       localFolder,
       remoteFolder: directToRoot ? "/" : `/${path.basename(localFolder)}`,
-      deleteExtraneous: false,
+      deleteExtraneous: true,
     };
   }
 
