@@ -488,18 +488,49 @@ export class CalSciHybridPanel implements vscode.Disposable {
     }
     .shell-switch {
       position: absolute;
-      left: 6%;
-      top: 1.7%;
+      left: 2.8%;
+      top: 1.55%;
       min-height: 24px;
+      max-width: 34%;
       z-index: 2;
     }
     .shell-switch .switch-row {
-      padding: 3px 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 2px 7px;
+      border-radius: 999px;
       background: rgba(255, 255, 255, 0.9);
       box-shadow: 0 6px 16px rgba(28, 33, 40, 0.08);
+      white-space: nowrap;
     }
     .shell-switch .switch-row label {
+      font-size: clamp(8px, 0.95vw, 10px);
+    }
+    .shell-mode-button {
+      min-width: 38px;
+      height: 21px;
+      border: 1px solid #8f9398;
+      border-radius: 999px;
+      background: linear-gradient(180deg, #ffffff 0%, #eceff2 100%);
+      color: #1c2128;
       font-size: clamp(9px, 1vw, 11px);
+      font-weight: 600;
+      cursor: pointer;
+      padding: 0 9px;
+      transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+    .shell-mode-button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 10px rgba(28, 33, 40, 0.12);
+    }
+    .shell-mode-button:active {
+      transform: translateY(1px);
+      box-shadow: none;
+    }
+    .shell-mode-button:focus-visible {
+      outline: 2px solid #0a7a52;
+      outline-offset: 2px;
     }
     .shell-switch .switch-input {
       width: 32px;
@@ -533,6 +564,54 @@ export class CalSciHybridPanel implements vscode.Disposable {
       align-items: stretch;
       justify-content: stretch;
       overflow: hidden;
+    }
+    .display-stage {
+      position: absolute;
+      inset: 0;
+      transform-origin: top left;
+      will-change: transform;
+      touch-action: none;
+    }
+    .display-toolbar {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 3;
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 999px;
+      background: rgba(12, 16, 20, 0.78);
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+      backdrop-filter: blur(10px);
+    }
+    .display-tool-button {
+      min-width: 34px;
+      height: 30px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.12);
+      color: #f7fbff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      padding: 0 10px;
+    }
+    .display-tool-button:disabled {
+      cursor: default;
+      opacity: 0.45;
+    }
+    .display-tool-button:not(:disabled):hover {
+      background: rgba(255, 255, 255, 0.18);
+    }
+    .display-zoom-value {
+      min-width: 52px;
+      color: #f7fbff;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-align: center;
     }
     canvas {
       width: 100%;
@@ -686,6 +765,58 @@ export class CalSciHybridPanel implements vscode.Disposable {
       overflow: hidden;
       text-overflow: clip;
     }
+    body.display-focus {
+      background: #0d1117;
+    }
+    body.display-focus .page {
+      min-height: 100vh;
+      padding: 0;
+    }
+    body.display-focus .workspace,
+    body.display-focus .shell-wrap {
+      width: 100%;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    body.display-focus .device-shell {
+      width: min(96vw, calc(94vh * 2));
+      aspect-ratio: 2 / 1;
+      height: auto;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+    body.display-focus .display-window {
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      border: 2px solid #939393;
+      border-radius: 18px;
+      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.35);
+      touch-action: none;
+    }
+    body.display-focus .display-window.pannable {
+      cursor: grab;
+    }
+    body.display-focus .display-window.panning {
+      cursor: grabbing;
+    }
+    body.display-focus .display-toolbar {
+      display: flex;
+    }
+    body.display-focus .brand-badge,
+    body.display-focus .shell-switch,
+    body.display-focus .display-bezel,
+    body.display-focus .system-cluster,
+    body.display-focus .nav-cluster,
+    body.display-focus .section-one,
+    body.display-focus .section-two {
+      display: none;
+    }
     @media (max-width: 920px) {
       .workspace {
         justify-content: center;
@@ -702,17 +833,26 @@ export class CalSciHybridPanel implements vscode.Disposable {
   <main class="page">
     <section class="workspace">
       <div class="shell-wrap">
-        <section class="device-shell" id="deviceShell">
+        <section class="device-shell" id="deviceShell" tabindex="0">
           <div class="shell-switch">
             <div class="switch-row">
               <label for="toggleSwitch">Hybrid</label>
               <input class="switch-input" id="toggleSwitch" type="checkbox" />
+              <button class="shell-mode-button" id="displayOnlyButton" type="button">Full</button>
             </div>
           </div>
           <div class="brand-badge">CalSci</div>
           <div class="display-bezel"></div>
-          <div class="display-window">
-            <canvas id="displayCanvas" width="128" height="64"></canvas>
+          <div class="display-window" id="displayWindow">
+            <div class="display-stage" id="displayStage">
+              <canvas id="displayCanvas" width="128" height="64"></canvas>
+            </div>
+            <div class="display-toolbar">
+              <button class="display-tool-button" id="zoomOutButton" type="button" title="Zoom out">-</button>
+              <span class="display-zoom-value" id="displayZoomValue">100%</span>
+              <button class="display-tool-button" id="zoomInButton" type="button" title="Zoom in">+</button>
+              <button class="display-tool-button" id="zoomResetButton" type="button" title="Reset zoom and pan">Fit</button>
+            </div>
           </div>
           <div class="cluster system-cluster" id="systemCluster"></div>
           <div class="cluster nav-cluster" id="navCluster"></div>
@@ -730,10 +870,34 @@ export class CalSciHybridPanel implements vscode.Disposable {
       session: { connected: false },
       hybridStatus: { connected: false, active: false },
       hybridState: {},
+      displayOnly: false,
+      displayViewport: {
+        scale: 1,
+        offsetX: 0,
+        offsetY: 0,
+        panning: false,
+        pointerId: null,
+        startX: 0,
+        startY: 0,
+        startOffsetX: 0,
+        startOffsetY: 0,
+      },
     };
 
+    const DISPLAY_SCALE_MIN = 0.5;
+    const DISPLAY_FIT_SCALE = 1;
+    const DISPLAY_SCALE_MAX = 6;
+    const DISPLAY_SCALE_STEP = 0.25;
+
     const toggleSwitch = document.getElementById("toggleSwitch");
+    const displayOnlyButton = document.getElementById("displayOnlyButton");
     const deviceShell = document.getElementById("deviceShell");
+    const displayWindow = document.getElementById("displayWindow");
+    const displayStage = document.getElementById("displayStage");
+    const zoomOutButton = document.getElementById("zoomOutButton");
+    const zoomInButton = document.getElementById("zoomInButton");
+    const zoomResetButton = document.getElementById("zoomResetButton");
+    const displayZoomValue = document.getElementById("displayZoomValue");
     const systemCluster = document.getElementById("systemCluster");
     const navCluster = document.getElementById("navCluster");
     const sectionOne = document.getElementById("sectionOne");
@@ -852,6 +1016,100 @@ export class CalSciHybridPanel implements vscode.Disposable {
       appendRows(sectionTwo, profile.section2);
     }
 
+    function setDisplayOnly(enabled) {
+      state.displayOnly = Boolean(enabled);
+      document.body.classList.toggle("display-focus", state.displayOnly);
+      if (state.displayOnly) {
+        requestAnimationFrame(() => {
+          resetDisplayViewport();
+          deviceShell.focus();
+          render();
+        });
+        return;
+      }
+      resetDisplayViewport();
+    }
+
+    function clampDisplayOffsets(offsetX, offsetY, scale = state.displayViewport.scale) {
+      const width = displayWindow.clientWidth || 0;
+      const height = displayWindow.clientHeight || 0;
+      const scaledWidth = width * scale;
+      const scaledHeight = height * scale;
+      if (scale <= DISPLAY_FIT_SCALE + 0.001) {
+        return {
+          x: (width - scaledWidth) / 2,
+          y: (height - scaledHeight) / 2,
+        };
+      }
+      const minX = width - scaledWidth;
+      const minY = height - scaledHeight;
+      return {
+        x: Math.min(0, Math.max(minX, offsetX)),
+        y: Math.min(0, Math.max(minY, offsetY)),
+      };
+    }
+
+    function applyDisplayTransform() {
+      const viewport = state.displayViewport;
+      const clamped = clampDisplayOffsets(viewport.offsetX, viewport.offsetY, viewport.scale);
+      viewport.offsetX = clamped.x;
+      viewport.offsetY = clamped.y;
+      displayStage.style.transform =
+        "translate(" + viewport.offsetX + "px, " + viewport.offsetY + "px) scale(" + viewport.scale + ")";
+      displayWindow.classList.toggle("pannable", state.displayOnly && viewport.scale > DISPLAY_FIT_SCALE + 0.001);
+      displayWindow.classList.toggle("panning", state.displayOnly && viewport.panning);
+      displayZoomValue.textContent = Math.round(viewport.scale * 100) + "%";
+    }
+
+    function resetDisplayViewport() {
+      state.displayViewport.scale = DISPLAY_FIT_SCALE;
+      state.displayViewport.offsetX = 0;
+      state.displayViewport.offsetY = 0;
+      state.displayViewport.panning = false;
+      state.displayViewport.pointerId = null;
+      applyDisplayTransform();
+    }
+
+    function isDisplayViewportFit() {
+      return (
+        Math.abs(state.displayViewport.scale - DISPLAY_FIT_SCALE) < 0.001 &&
+        Math.abs(state.displayViewport.offsetX) < 0.5 &&
+        Math.abs(state.displayViewport.offsetY) < 0.5
+      );
+    }
+
+    function setDisplayScale(nextScale) {
+      const viewport = state.displayViewport;
+      const scale = Math.max(DISPLAY_SCALE_MIN, Math.min(DISPLAY_SCALE_MAX, nextScale));
+      if (Math.abs(scale - viewport.scale) < 0.001) {
+        return;
+      }
+      const width = displayWindow.clientWidth || 0;
+      const height = displayWindow.clientHeight || 0;
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const contentX = (centerX - viewport.offsetX) / viewport.scale;
+      const contentY = (centerY - viewport.offsetY) / viewport.scale;
+
+      viewport.scale = scale;
+      viewport.offsetX = centerX - (contentX * scale);
+      viewport.offsetY = centerY - (contentY * scale);
+      applyDisplayTransform();
+    }
+
+    function stopDisplayPan(pointerId) {
+      const viewport = state.displayViewport;
+      if (viewport.pointerId !== pointerId) {
+        return;
+      }
+      viewport.panning = false;
+      viewport.pointerId = null;
+      if (displayWindow.hasPointerCapture(pointerId)) {
+        displayWindow.releasePointerCapture(pointerId);
+      }
+      applyDisplayTransform();
+    }
+
     function render() {
       const connected = Boolean(state.session.connected);
       const active = Boolean(state.hybridStatus.active);
@@ -859,9 +1117,18 @@ export class CalSciHybridPanel implements vscode.Disposable {
       toggleSwitch.checked = active;
       toggleSwitch.disabled = !connected;
       toggleSwitch.title = connected ? "Toggle hybrid mode" : "Connect a CalSci device to enable hybrid mode.";
+      displayOnlyButton.textContent = state.displayOnly ? "Exit" : "Full";
+      displayOnlyButton.title = state.displayOnly
+        ? "Exit display-only mode."
+        : "Show only the simulator display. Press Enter or Escape to exit.";
       deviceShell.classList.toggle("live", active);
+      document.body.classList.toggle("display-focus", state.displayOnly);
+      zoomOutButton.disabled = !state.displayOnly || state.displayViewport.scale <= DISPLAY_SCALE_MIN + 0.001;
+      zoomInButton.disabled = !state.displayOnly || state.displayViewport.scale >= DISPLAY_SCALE_MAX - 0.001;
+      zoomResetButton.disabled = !state.displayOnly || isDisplayViewportFit();
 
       drawDisplay();
+      applyDisplayTransform();
       document.querySelectorAll(".shell-key").forEach((button) => {
         const element = button;
         if (element.dataset.mapped === "true") {
@@ -879,6 +1146,107 @@ export class CalSciHybridPanel implements vscode.Disposable {
         return;
       }
       vscode.postMessage({ type: "toggleHybrid", enabled: toggleSwitch.checked });
+    });
+
+    displayOnlyButton.addEventListener("click", () => {
+      setDisplayOnly(!state.displayOnly);
+      render();
+    });
+
+    zoomInButton.addEventListener("click", () => {
+      setDisplayScale(state.displayViewport.scale + DISPLAY_SCALE_STEP);
+      render();
+    });
+
+    zoomOutButton.addEventListener("click", () => {
+      setDisplayScale(state.displayViewport.scale - DISPLAY_SCALE_STEP);
+      render();
+    });
+
+    zoomResetButton.addEventListener("click", () => {
+      resetDisplayViewport();
+      render();
+    });
+
+    displayWindow.addEventListener("pointerdown", (event) => {
+      if (!state.displayOnly || state.displayViewport.scale <= DISPLAY_FIT_SCALE + 0.001) {
+        return;
+      }
+      state.displayViewport.panning = true;
+      state.displayViewport.pointerId = event.pointerId;
+      state.displayViewport.startX = event.clientX;
+      state.displayViewport.startY = event.clientY;
+      state.displayViewport.startOffsetX = state.displayViewport.offsetX;
+      state.displayViewport.startOffsetY = state.displayViewport.offsetY;
+      displayWindow.setPointerCapture(event.pointerId);
+      applyDisplayTransform();
+      event.preventDefault();
+    });
+
+    displayWindow.addEventListener("pointermove", (event) => {
+      if (!state.displayViewport.panning || state.displayViewport.pointerId !== event.pointerId) {
+        return;
+      }
+      state.displayViewport.offsetX =
+        state.displayViewport.startOffsetX + (event.clientX - state.displayViewport.startX);
+      state.displayViewport.offsetY =
+        state.displayViewport.startOffsetY + (event.clientY - state.displayViewport.startY);
+      applyDisplayTransform();
+    });
+
+    displayWindow.addEventListener("pointerup", (event) => {
+      stopDisplayPan(event.pointerId);
+    });
+
+    displayWindow.addEventListener("pointercancel", (event) => {
+      stopDisplayPan(event.pointerId);
+    });
+
+    displayWindow.addEventListener("wheel", (event) => {
+      if (!state.displayOnly) {
+        return;
+      }
+      event.preventDefault();
+      const direction = event.deltaY < 0 ? DISPLAY_SCALE_STEP : -DISPLAY_SCALE_STEP;
+      setDisplayScale(state.displayViewport.scale + direction);
+      render();
+    }, { passive: false });
+
+    window.addEventListener("keydown", (event) => {
+      if (!state.displayOnly) {
+        return;
+      }
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        setDisplayScale(state.displayViewport.scale + DISPLAY_SCALE_STEP);
+        render();
+        return;
+      }
+      if (event.key === "-" || event.key === "_") {
+        event.preventDefault();
+        setDisplayScale(state.displayViewport.scale - DISPLAY_SCALE_STEP);
+        render();
+        return;
+      }
+      if (event.key === "0") {
+        event.preventDefault();
+        resetDisplayViewport();
+        render();
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Escape") {
+        event.preventDefault();
+        setDisplayOnly(false);
+        render();
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      if (!state.displayOnly) {
+        return;
+      }
+      applyDisplayTransform();
+      render();
     });
 
     window.addEventListener("message", (event) => {
