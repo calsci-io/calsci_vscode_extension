@@ -13,6 +13,7 @@ type WorkspaceTreeSnapshot = {
 
 type WorkspaceViewHandlers = {
   scanTree: () => Promise<WorkspaceTreeSnapshot>;
+  shouldAutoLoad?: () => boolean;
 };
 
 type WorkspaceNode = {
@@ -77,6 +78,7 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
   private loadedPort: string | undefined;
   private errorMessage: string | undefined;
   private loadPromise: Promise<void> | undefined;
+  private manualLoadRequested = false;
 
   public readonly onDidChangeTreeData = this.changeEmitter.event;
 
@@ -87,12 +89,18 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
     this.loadedPort = undefined;
     this.errorMessage = undefined;
     this.loadPromise = undefined;
+    this.manualLoadRequested = false;
     this.root.children = [];
     this.changeEmitter.fire();
   }
 
   public async reload(): Promise<void> {
-    this.invalidate();
+    this.scanState = "idle";
+    this.loadedPort = undefined;
+    this.errorMessage = undefined;
+    this.loadPromise = undefined;
+    this.manualLoadRequested = true;
+    this.root.children = [];
     await this.ensureLoaded();
     this.changeEmitter.fire();
   }
@@ -102,6 +110,14 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
   }
 
   public async getChildren(element?: CalSciWorkspaceItem): Promise<CalSciWorkspaceItem[]> {
+    const shouldAutoLoad = this.handlers.shouldAutoLoad?.() ?? true;
+    if (!shouldAutoLoad && !this.manualLoadRequested && this.scanState === "idle") {
+      if (element) {
+        return [];
+      }
+      return [this.createPlaceholder("Refresh CalSci workspace to scan device")];
+    }
+
     await this.ensureLoaded();
 
     if (this.scanState === "error") {

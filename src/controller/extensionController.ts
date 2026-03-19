@@ -69,6 +69,9 @@ export class CalSciExtensionController implements vscode.Disposable {
   private lastSessionAttemptAt = 0;
   private lastSessionAttemptPort: string | undefined;
   private lastSessionError: string | undefined;
+  private pendingHybridRestorePort: string | undefined;
+  private hybridRestoreInFlight = false;
+  private recentTerminalOutput = "";
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.backend = new BackendServiceClient(context);
@@ -94,11 +97,15 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.workspaceContentProvider = new CalSciWorkspaceContentProvider();
     this.workspaceViewProvider = new CalSciWorkspaceViewProvider({
       scanTree: async () => this.scanWorkspaceTree(),
+      shouldAutoLoad: () => this.shouldAutoScanWorkspace(),
     });
     this.selectedPort = this.context.globalState.get<string>(SELECTED_PORT_KEY);
     this.setRunVisible(false);
 
     this.context.subscriptions.push(
+      this.backend.onTerminalOutput((data: string) => {
+        this.handleTerminalOutput(data);
+      }),
       this.backend.onSessionState((state: SessionState) => {
         this.handleSessionStateChange(state);
       }),
@@ -149,9 +156,14 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     this.refreshStatus();
     this.workspaceViewProvider.invalidate();
-    await this.pollDevices({ forceSessionConnect: true, showTerminalOnConnect: true });
+    const autoConnect = this.shouldAutoConnectOnDetect();
+    await this.pollDevices({
+      forceSessionConnect: autoConnect,
+      allowSessionConnect: autoConnect,
+      showTerminalOnConnect: autoConnect,
+    });
     this.pollTimer = setInterval(() => {
-      void this.pollDevices();
+      void this.pollDevices({ allowSessionConnect: this.shouldAutoConnectOnDetect() });
     }, POLL_INTERVAL_MS);
   }
 
@@ -279,6 +291,10 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
 
     const timeout = vscode.workspace.getConfiguration("calsci").get<number>("resetTimeoutSeconds", 5);
+    const restoreHybridAfterReset = this.hybridStatus.active;
+    if (restoreHybridAfterReset) {
+      await this.stopHybridForExclusiveOperation();
+    }
 
     let result: SoftResetResult;
     try {
@@ -317,6 +333,15 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
 
     if (result.ok) {
+      if (restoreHybridAfterReset) {
+        const restored = await this.restoreHybridWithRetries(port);
+        if (!restored) {
+          void vscode.window.showWarningMessage(
+            `Soft reset finished on ${port}, but hybrid helper did not restart. Toggle Hybrid back on after the prompt settles.`,
+          );
+        }
+      }
+
       if (result.promptSeen) {
         void vscode.window.showInformationMessage(`Soft reset complete on ${port}. CalSci prompt verified.`);
       } else if (result.rebootSeen) {
@@ -373,6 +398,7 @@ export class CalSciExtensionController implements vscode.Disposable {
         return;
       }
 
+      const restoreHybridAfterRun = this.hybridStatus.active && await this.stopHybridForExclusiveOperation();
       const timeout = vscode.workspace.getConfiguration("calsci").get<number>("runTimeoutSeconds", 0);
       let result: RunFileResult;
 
@@ -435,6 +461,9 @@ export class CalSciExtensionController implements vscode.Disposable {
 
       await this.pollDevices();
       this.runOutput.show(false);
+      if (restoreHybridAfterRun) {
+        await this.restoreHybridAfterRun(port, false);
+      }
 
       if (result.cancelled) {
         void vscode.window.showInformationMessage(`Non-interactive run cancelled on ${port}: ${path.basename(localFile)}`);
@@ -492,6 +521,8 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
 
+    const hybridStoppedForInteractiveRun = this.hybridStatus.active && await this.stopHybridForExclusiveOperation();
+
     let result: RunInteractiveFileResult;
     try {
       this.operationInFlight += 1;
@@ -509,13 +540,24 @@ export class CalSciExtensionController implements vscode.Disposable {
     await this.pollDevices();
 
     if (!result.ok) {
+      if (hybridStoppedForInteractiveRun) {
+        await this.restoreHybridAfterRun(port, false);
+      }
       const detail = result.error ? ` ${result.error}` : "";
       void vscode.window.showErrorMessage(`Interactive run failed on ${port}.${detail}`);
       return;
     }
 
     this.showReplTerminal(false);
-    void vscode.window.showInformationMessage(`Interactive run started on ${port}: ${path.basename(localFile)}`);
+    if (hybridStoppedForInteractiveRun) {
+      await this.restoreHybridAfterRun(port, true);
+    }
+    const hybridNote = hybridStoppedForInteractiveRun
+      ? " Hybrid helper was disabled for the run and will turn back on when the prompt returns."
+      : "";
+    void vscode.window.showInformationMessage(
+      `Interactive run started on ${port}: ${path.basename(localFile)}.${hybridNote}`,
+    );
   }
 
   private async syncFolderCommand(folderUri?: vscode.Uri): Promise<void> {
@@ -951,6 +993,112 @@ export class CalSciExtensionController implements vscode.Disposable {
     return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
   }
 
+  private shouldAutoConnectOnDetect(): boolean {
+    return vscode.workspace.getConfiguration("calsci").get<boolean>("autoConnectOnDetect", false);
+  }
+
+  private shouldAutoScanWorkspace(): boolean {
+    return vscode.workspace.getConfiguration("calsci").get<boolean>("autoScanWorkspace", false);
+  }
+
+  private async stopHybridForExclusiveOperation(): Promise<boolean> {
+    if (!this.hybridStatus.active) {
+      return false;
+    }
+
+    try {
+      const snapshot = await this.backend.stopHybrid();
+      this.applyHybridSnapshot(snapshot);
+      return !this.hybridStatus.active;
+    } catch {
+      // Best effort only. The following exclusive operation still pauses normal polling.
+      return false;
+    }
+  }
+
+  private async restoreHybridWithRetries(port: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const connected = await this.ensureSessionForPort(port, {
+          force: true,
+          notifyOnError: false,
+          showTerminal: false,
+        });
+        if (!connected) {
+          continue;
+        }
+
+        const snapshot = await this.backend.startHybrid(port);
+        this.applyHybridSnapshot(snapshot);
+        if (snapshot.ok) {
+          return true;
+        }
+      } catch {
+        // Retry once after a short settle delay.
+      }
+
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+    }
+
+    return false;
+  }
+
+  private async restoreHybridAfterRun(port: string, waitForPrompt: boolean): Promise<void> {
+    if (waitForPrompt) {
+      this.pendingHybridRestorePort = port;
+      void this.tryRestoreHybridAfterPrompt();
+      return;
+    }
+
+    this.pendingHybridRestorePort = undefined;
+    const restored = await this.restoreHybridWithRetries(port);
+    if (!restored) {
+      void vscode.window.showWarningMessage(
+        `Run finished on ${port}, but hybrid helper did not restart. Toggle Hybrid back on after the prompt settles.`,
+      );
+    }
+  }
+
+  private handleTerminalOutput(data: string): void {
+    this.recentTerminalOutput = (this.recentTerminalOutput + data).slice(-256);
+    void this.tryRestoreHybridAfterPrompt();
+  }
+
+  private async tryRestoreHybridAfterPrompt(): Promise<void> {
+    const port = this.pendingHybridRestorePort;
+    if (!port || this.hybridRestoreInFlight) {
+      return;
+    }
+    if (!this.sessionState.connected || this.sessionState.port !== port) {
+      return;
+    }
+    if (!this.terminalBufferHasFriendlyPrompt()) {
+      return;
+    }
+
+    this.hybridRestoreInFlight = true;
+    try {
+      const restored = await this.restoreHybridWithRetries(port);
+      this.pendingHybridRestorePort = undefined;
+      if (restored) {
+        this.recentTerminalOutput = "";
+      } else {
+        void vscode.window.showWarningMessage(
+          `Interactive run finished on ${port}, but hybrid helper did not restart. Toggle Hybrid back on after the prompt settles.`,
+        );
+      }
+    } finally {
+      this.hybridRestoreInFlight = false;
+    }
+  }
+
+  private terminalBufferHasFriendlyPrompt(): boolean {
+    const normalized = this.recentTerminalOutput.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    return /(?:^|\n)(?:CalSci >>>|>>>)[ \t]*$/.test(normalized);
+  }
+
   private async openHybridPanel(): Promise<void> {
     if (this.hybridPanel) {
       this.hybridPanel.reveal();
@@ -1346,6 +1494,7 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
 
+    const allowSessionConnect = options?.allowSessionConnect ?? this.shouldAutoConnectOnDetect();
     this.pollInFlight = true;
     try {
       const result = await this.backend.scan();
@@ -1369,7 +1518,7 @@ export class CalSciExtensionController implements vscode.Disposable {
         return;
       }
 
-      if (options?.forceSessionConnect || this.shouldAttemptSession(this.selectedPort)) {
+      if (options?.forceSessionConnect || (allowSessionConnect && this.shouldAttemptSession(this.selectedPort))) {
         await this.ensureSessionForSelection({
           force: Boolean(options?.forceSessionConnect),
           notifyOnError: false,
@@ -1556,6 +1705,11 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.hybridPanel?.updateHybridStatus(this.hybridStatus);
     const portChanged = Boolean(previousPort && this.sessionState.port && previousPort !== this.sessionState.port);
     const disconnected = previousConnected && !this.sessionState.connected;
+    if (!this.sessionState.connected || (this.pendingHybridRestorePort && this.sessionState.port !== this.pendingHybridRestorePort)) {
+      this.pendingHybridRestorePort = undefined;
+      this.hybridRestoreInFlight = false;
+      this.recentTerminalOutput = "";
+    }
     if (portChanged || disconnected) {
       this.workspaceContentProvider.clear();
       this.workspaceViewProvider.invalidate();

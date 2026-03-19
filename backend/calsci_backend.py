@@ -258,16 +258,46 @@ def _split_helper_framed_text(text: str) -> tuple[str, list[str], str]:
     while True:
         start = text.find(HELPER_FRAME_PREFIX, scan)
         if start < 0:
-            visible_parts.append(text[scan:])
+            remainder = text[scan:]
+            overlap = _helper_frame_prefix_overlap(remainder)
+            if overlap > 0:
+                visible_parts.append(remainder[:-overlap])
+                return "".join(visible_parts), frames, remainder[-overlap:]
+            visible_parts.append(remainder)
             return "".join(visible_parts), frames, ""
 
         visible_parts.append(text[scan:start])
-        end = text.find(HELPER_FRAME_SUFFIX, start + len(HELPER_FRAME_PREFIX))
+        end = _find_helper_frame_suffix(text, start + len(HELPER_FRAME_PREFIX))
         if end < 0:
             return "".join(visible_parts), frames, text[start:]
 
         frames.append(text[start + len(HELPER_FRAME_PREFIX) : end])
         scan = end + len(HELPER_FRAME_SUFFIX)
+
+
+def _helper_frame_prefix_overlap(text: str) -> int:
+    if not text:
+        return 0
+
+    max_overlap = min(len(text), len(HELPER_FRAME_PREFIX) - 1)
+    for overlap in range(max_overlap, 0, -1):
+        if HELPER_FRAME_PREFIX.startswith(text[-overlap:]):
+            return overlap
+    return 0
+
+
+def _find_helper_frame_suffix(text: str, start: int) -> int:
+    search = start
+    while True:
+        end = text.find(HELPER_FRAME_SUFFIX, search)
+        if end < 0:
+            return -1
+
+        suffix_end = end + len(HELPER_FRAME_SUFFIX)
+        if suffix_end >= len(text) or text[suffix_end] == "\n":
+            return end
+
+        search = end + 1
 
 
 def _clean_helper_line(line: str) -> str:
@@ -368,6 +398,8 @@ def _looks_like_helper_terminal_fragment(text: str) -> bool:
     if not text:
         return False
     cleaned = _clean_helper_line(text)
+    if cleaned and HELPER_FRAME_PREFIX.startswith(cleaned):
+        return True
     if not cleaned:
         return False
     if cleaned.startswith(_HELPER_TERMINAL_PREFIXES):
@@ -2727,6 +2759,7 @@ class PersistentSession:
             stream_text = self._helper_frame_remainder + normalized
             visible_text, framed_payloads, frame_remainder = _split_helper_framed_text(stream_text)
             self._helper_frame_remainder = frame_remainder
+            helper_content_seen = bool(framed_payloads or frame_remainder)
 
             for framed in framed_payloads:
                 cleaned = _strip_repl_prompt_prefix(framed.replace("\r", "").strip()).strip()
@@ -2737,6 +2770,7 @@ class PersistentSession:
                 status_payloads, state_payloads = self._process_helper_line_locked(cleaned)
                 status_events.extend(status_payloads)
                 state_events.extend(state_payloads)
+                helper_content_seen = True
                 if suppress_helper_output or started_suppressed:
                     helper_activity_seen = True
                     self._suppress_terminal_helper_activity_seen = True
@@ -2749,19 +2783,21 @@ class PersistentSession:
                 raw_line = self._helper_line_buffer[:newline]
                 self._helper_line_buffer = self._helper_line_buffer[newline + 1 :]
                 raw_line_is_helper_fragment = _looks_like_helper_terminal_fragment(raw_line)
+                prompt_only_fragment = _is_prompt_only_fragment(raw_line)
                 cleaned = _clean_helper_line(raw_line)
                 if not cleaned:
-                    if _is_prompt_only_fragment(raw_line):
+                    if prompt_only_fragment:
                         with self._hybrid_lock:
                             self._hybrid_pause_until_prompt = False
-                    if started_suppressed and _is_prompt_only_fragment(raw_line):
+                    if started_suppressed and prompt_only_fragment:
                         if helper_activity_seen:
                             suppress_helper_output = self._consume_helper_prompt_locked()
                             helper_activity_seen = self._suppress_terminal_helper_activity_seen
                     elif started_suppressed and raw_line_is_helper_fragment:
                         helper_activity_seen = True
                         self._suppress_terminal_helper_activity_seen = True
-                    elif started_suppressed and raw_line.strip():
+                        helper_content_seen = True
+                    elif raw_line.strip() and not prompt_only_fragment and not raw_line_is_helper_fragment:
                         visible_chunks.append(raw_line + "\n")
                     continue
 
@@ -2772,11 +2808,14 @@ class PersistentSession:
                 status_events.extend(status_payloads)
                 state_events.extend(state_payloads)
 
-                if suppress_helper_output and (_looks_like_helper_terminal_line(cleaned) or raw_line_is_helper_fragment):
+                helper_line = _looks_like_helper_terminal_line(cleaned) or raw_line_is_helper_fragment
+                if helper_line:
+                    helper_content_seen = True
+                if suppress_helper_output and helper_line:
                     helper_activity_seen = True
                     self._suppress_terminal_helper_activity_seen = True
                     continue
-                if started_suppressed and raw_line.strip():
+                if raw_line.strip() and not helper_line:
                     visible_chunks.append(raw_line + "\n")
 
             if self._helper_line_buffer and _is_prompt_only_fragment(self._helper_line_buffer):
@@ -2789,7 +2828,7 @@ class PersistentSession:
 
             self._helper_condition.notify_all()
 
-        if started_suppressed:
+        if started_suppressed or helper_content_seen:
             if visible_chunks:
                 self._emit_terminal_text("".join(visible_chunks))
         else:

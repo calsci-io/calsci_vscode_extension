@@ -159,6 +159,16 @@
           "minimum": 0,
           "maximum": 600,
           "description": "Timeout for running active Python file on CalSci. Set to 0 to disable the timeout."
+        },
+        "calsci.autoConnectOnDetect": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically open a CalSci session when a detected device matches the current selection."
+        },
+        "calsci.autoScanWorkspace": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically scan the device workspace when the CalSci Workspace view is opened. Disable to require manual refresh."
         }
       }
     }

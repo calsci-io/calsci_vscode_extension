@@ -241,6 +241,7 @@ export type ProcessResult = {
 
 export type PollOptions = {
   forceSessionConnect?: boolean;
+  allowSessionConnect?: boolean;
   showTerminalOnConnect?: boolean;
 };
 

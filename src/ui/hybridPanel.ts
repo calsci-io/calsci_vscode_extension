@@ -388,26 +388,8 @@ export class CalSciHybridPanel implements vscode.Disposable {
       margin: 0 auto;
       padding: 18px 18px 24px;
       display: grid;
-      gap: 10px;
+      gap: 0;
       justify-items: center;
-    }
-    .toolbar {
-      width: 100%;
-      display: flex;
-      justify-content: flex-end;
-    }
-    .toolbar-right {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-      padding: 8px 10px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.58);
-      border: 1px solid rgba(255, 255, 255, 0.72);
-      box-shadow: 0 10px 28px rgba(28, 33, 40, 0.1);
-      backdrop-filter: blur(10px);
     }
     .switch-row {
       display: flex;
@@ -459,24 +441,6 @@ export class CalSciHybridPanel implements vscode.Disposable {
       cursor: default;
       opacity: 0.45;
     }
-    .action-button {
-      border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.9);
-      color: var(--ink);
-      padding: 8px 12px;
-      border-radius: 999px;
-      font: inherit;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.03em;
-      cursor: pointer;
-    }
-    .action-button:hover {
-      background: rgba(255, 255, 255, 0.98);
-    }
-    .action-button:active {
-      transform: translateY(1px);
-    }
     .workspace {
       display: flex;
       justify-content: center;
@@ -521,6 +485,32 @@ export class CalSciHybridPanel implements vscode.Disposable {
       font-size: clamp(13px, 1.45vw, 16px);
       font-weight: 500;
       letter-spacing: 0.04em;
+    }
+    .shell-switch {
+      position: absolute;
+      left: 6%;
+      top: 1.7%;
+      min-height: 24px;
+      z-index: 2;
+    }
+    .shell-switch .switch-row {
+      padding: 3px 8px;
+      background: rgba(255, 255, 255, 0.9);
+      box-shadow: 0 6px 16px rgba(28, 33, 40, 0.08);
+    }
+    .shell-switch .switch-row label {
+      font-size: clamp(9px, 1vw, 11px);
+    }
+    .shell-switch .switch-input {
+      width: 32px;
+      height: 18px;
+    }
+    .shell-switch .switch-input::after {
+      width: 14px;
+      height: 14px;
+    }
+    .shell-switch .switch-input:checked::after {
+      transform: translateX(14px);
     }
     .display-bezel {
       position: absolute;
@@ -705,31 +695,20 @@ export class CalSciHybridPanel implements vscode.Disposable {
       .page {
         padding: 12px;
       }
-      .toolbar {
-        width: 100%;
-      }
-      .toolbar-right {
-        width: 100%;
-        justify-content: center;
-      }
     }
   </style>
 </head>
 <body>
   <main class="page">
-    <section class="toolbar">
-      <div class="toolbar-right">
-        <div class="switch-row">
-          <label for="toggleSwitch">Hybrid</label>
-          <input class="switch-input" id="toggleSwitch" type="checkbox" />
-        </div>
-        <button class="action-button" id="uploadFirmwareButton" type="button">Upload Firmware</button>
-      </div>
-    </section>
-
     <section class="workspace">
       <div class="shell-wrap">
         <section class="device-shell" id="deviceShell">
+          <div class="shell-switch">
+            <div class="switch-row">
+              <label for="toggleSwitch">Hybrid</label>
+              <input class="switch-input" id="toggleSwitch" type="checkbox" />
+            </div>
+          </div>
           <div class="brand-badge">CalSci</div>
           <div class="display-bezel"></div>
           <div class="display-window">
@@ -754,7 +733,6 @@ export class CalSciHybridPanel implements vscode.Disposable {
     };
 
     const toggleSwitch = document.getElementById("toggleSwitch");
-    const uploadFirmwareButton = document.getElementById("uploadFirmwareButton");
     const deviceShell = document.getElementById("deviceShell");
     const systemCluster = document.getElementById("systemCluster");
     const navCluster = document.getElementById("navCluster");
@@ -901,9 +879,6 @@ export class CalSciHybridPanel implements vscode.Disposable {
         return;
       }
       vscode.postMessage({ type: "toggleHybrid", enabled: toggleSwitch.checked });
-    });
-    uploadFirmwareButton.addEventListener("click", () => {
-      vscode.postMessage({ type: "uploadFirmware" });
     });
 
     window.addEventListener("message", (event) => {

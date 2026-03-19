@@ -46,6 +46,12 @@ class HelperSuppressionTests(unittest.TestCase):
         self.assertEqual(parsed["lines"], ['STATE:{"frame_id":7,"changed":false}'])
         self.assertEqual(parsed["states"], [{"frame_id": 7, "changed": False}])
 
+    def test_split_helper_framed_text_buffers_partial_prefix(self) -> None:
+        visible, frames, remainder = backend._split_helper_framed_text("visible\n{{CALSCI_HY")
+        self.assertEqual(visible, "visible\n")
+        self.assertEqual(frames, [])
+        self.assertEqual(remainder, "{{CALSCI_HY")
+
     def test_suppressed_helper_fragment_does_not_pollute_terminal(self) -> None:
         emitted: list[str] = []
         session = backend.PersistentSession(emitted.append, lambda _payload: None, lambda _payload: None)
@@ -60,6 +66,27 @@ class HelperSuppressionTests(unittest.TestCase):
         session._process_terminal_text('\nCalSci >>> ')
 
         self.assertEqual(emitted, [])
+
+    def test_unsuppressed_partial_helper_frame_does_not_pollute_terminal(self) -> None:
+        emitted: list[str] = []
+        session = backend.PersistentSession(emitted.append, lambda _payload: None, lambda _payload: None)
+
+        session._process_terminal_text("visible\n{{CALSCI_HY")
+        session._process_terminal_text('B:STATE:{"frame_id":1,"changed":false}}\n')
+
+        self.assertEqual(emitted, ["visible\n"])
+
+    def test_unsuppressed_helper_lines_are_filtered_from_terminal(self) -> None:
+        emitted: list[str] = []
+        session = backend.PersistentSession(emitted.append, lambda _payload: None, lambda _payload: None)
+
+        session._process_terminal_text(
+            "visible\n"
+            '_hyb_poll_state(7) if "_hyb_poll_state" in globals() else print("HYBRID_SYNC_ERR:HELPER_MISSING")\n'
+            "HYBRID_MODE:ON\n"
+        )
+
+        self.assertEqual(emitted, ["visible\n"])
 
     def test_overlapping_helper_prompts_and_next_command_stay_suppressed(self) -> None:
         emitted: list[str] = []
