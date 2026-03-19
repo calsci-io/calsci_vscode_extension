@@ -94,6 +94,7 @@ SYNC_TARGETED_SCAN_BATCH_SIZE = 64
 SYNC_TARGETED_SCAN_MAX_SCRIPT_CHARS = 2600
 SYNC_TARGETED_VERIFY_MAX_FILES = 64
 SYNC_TARGETED_VERIFY_TIMEOUT_SEC = 8.0
+SYNC_CLEAR_ALL_TIMEOUT_SEC = 60.0
 WORKSPACE_IMPORT_FILE_CHUNK_BYTES = 128
 WORKSPACE_READ_TEXT_CHUNK_CHARS = 256
 WORKSPACE_IMPORT_FILE_TIMEOUT_MAX_SEC = 90.0
@@ -122,6 +123,7 @@ COMMAND_PRIORITY = {
     "run-file-interactive": 9,
     "run-file": 10,
     "sync-folder": 11,
+    "clear-all-files": 11,
     "workspace.scan-tree": 11,
     "workspace.read-file": 11,
     "workspace.import": 11,
@@ -1172,6 +1174,24 @@ class CalSciController:
         result = self.sync_exec_raw_and_read(code, timeout=3.0)
         return "DELETED" in result
 
+    def sync_clear_all(self, timeout: float = SYNC_CLEAR_ALL_TIMEOUT_SEC) -> str:
+        return self.sync_exec_raw_and_read(_device_clear_all_script(), timeout=timeout)
+
+    def sync_put_content(self, remote_path: str, data: bytes, timeout: float | None = None) -> None:
+        code = _device_put_file_script(remote_path, data)
+        result = self.sync_exec_raw_and_read(
+            code,
+            timeout=timeout if timeout is not None else _estimate_sync_source_timeout(
+                code,
+                minimum_seconds=SYNC_FILE_UPLOAD_TIMEOUT_SEC,
+            ),
+        )
+        if "Traceback" in result:
+            raise ControllerError(result.strip())
+        if "OK" not in result:
+            preview = result.strip()
+            raise ControllerError(f"No OK confirmation: {preview[:200]}")
+
     def sync_put_raw(self, local_path: Path, remote_path: str) -> None:
         if not self._in_raw_repl:
             raise ControllerError("raw REPL is not active")
@@ -1917,6 +1937,129 @@ class PersistentSession:
             payload["ok"] = False
             existing_error = payload.get("error")
             restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after folder sync"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def clear_all_files(
+        self,
+        port: str | None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "filesDeleted": 0,
+                    "directoriesDeleted": 0,
+                    "warningsReported": 0,
+                    "bootCreated": False,
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        def report(line: str) -> None:
+            if progress_callback is not None:
+                progress_callback(line)
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "filesDeleted": 0,
+                    "directoriesDeleted": 0,
+                    "warningsReported": 0,
+                    "bootCreated": False,
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                try:
+                    enter_raw = getattr(controller, "_enter_raw_repl", None)
+                    if callable(enter_raw):
+                        enter_raw(timeout_overall=RAW_REPL_ENTER_TIMEOUT_SEC)
+                except Exception:
+                    pass
+
+                report("Starting desktop-style CalSci cleanup…")
+                cleanup_output = controller.sync_clear_all(timeout=SYNC_CLEAR_ALL_TIMEOUT_SEC)
+                cleanup_summary = _parse_clear_all_output(cleanup_output)
+
+                if not cleanup_summary["doneSeen"]:
+                    raise ControllerError("Cleanup timeout - operation may be incomplete")
+
+                for file_path in cleanup_summary["filesDeleted"]:
+                    report(f"Deleted file: {file_path}")
+                for dir_path in cleanup_summary["directoriesDeleted"]:
+                    report(f"Deleted folder: {dir_path}")
+                for warning_line in cleanup_summary["warningLines"]:
+                    report(f"Warning: {warning_line}")
+                for extra_line in cleanup_summary["otherLines"]:
+                    report(extra_line)
+
+                report("Creating empty boot.py…")
+                controller.sync_put_content("boot.py", b"")
+                report("Empty boot.py created ✓")
+
+                warning_count = len(cleanup_summary["warningLines"])
+                report(
+                    "Clear complete: "
+                    f"{len(cleanup_summary['filesDeleted'])} files deleted, "
+                    f"{len(cleanup_summary['directoriesDeleted'])} folders deleted, "
+                    f"{warning_count} warning(s)"
+                )
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "filesDeleted": len(cleanup_summary["filesDeleted"]),
+                    "directoriesDeleted": len(cleanup_summary["directoriesDeleted"]),
+                    "warningsReported": warning_count,
+                    "bootCreated": True,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "filesDeleted": 0,
+                    "directoriesDeleted": 0,
+                    "warningsReported": 0,
+                    "bootCreated": False,
+                    "error": str(exc),
+                }
+                recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                try:
+                    if bool(getattr(controller, "_in_raw_repl", False)):
+                        exit_raw = getattr(controller, "sync_exit_raw_repl", None)
+                        if callable(exit_raw):
+                            exit_raw()
+                except Exception:
+                    pass
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after clear-all"
             if existing_error:
                 payload["error"] = f"{existing_error} | restore failed: {restore_error}"
             else:
@@ -3151,6 +3294,15 @@ class JobDispatcher:
                         )
                     ) if job.stream else None,
                 )
+            if job.command == "clear-all-files":
+                return self._session.clear_all_files(
+                    port=_optional_arg_string(args, "port"),
+                    progress_callback=(
+                        lambda line, req_id=job.request_id: _service_emit(
+                            {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
+                        )
+                    ) if job.stream else None,
+                )
             if job.command == "workspace.scan-tree":
                 return self._session.workspace_scan_tree(
                     port=_optional_arg_string(args, "port"),
@@ -3597,6 +3749,10 @@ def _device_delete_file_script(remote_file: str) -> str:
     return _sync_scripts.device_delete_file_script(remote_file)
 
 
+def _device_clear_all_script() -> str:
+    return _sync_scripts.device_clear_all_script()
+
+
 def _device_list_file_sizes_script(remote_root: str) -> str:
     return _sync_scripts.device_list_file_sizes_script(remote_root)
 
@@ -4040,6 +4196,45 @@ def _parse_device_text_file_output(output: str, *, remote_path: str) -> str:
         return ""
     content = output[content_start + 1 : end_index]
     return content.rstrip("\r\n")
+
+
+def _parse_clear_all_output(output: str) -> dict[str, Any]:
+    files_deleted: list[str] = []
+    directories_deleted: list[str] = []
+    warning_lines: list[str] = []
+    other_lines: list[str] = []
+    start_seen = False
+    done_seen = False
+
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "CLEANUP_START":
+            start_seen = True
+            continue
+        if line == "CLEANUP_DONE":
+            done_seen = True
+            continue
+        if line.startswith("FILE_DEL:"):
+            files_deleted.append(line[len("FILE_DEL:") :].strip())
+            continue
+        if line.startswith("DIR_DEL:"):
+            directories_deleted.append(line[len("DIR_DEL:") :].strip())
+            continue
+        if line.startswith("FILE_ERR:") or line.startswith("DIR_ERR:") or line.startswith("ERR:"):
+            warning_lines.append(line)
+            continue
+        other_lines.append(line)
+
+    return {
+        "startSeen": start_seen,
+        "doneSeen": done_seen,
+        "filesDeleted": files_deleted,
+        "directoriesDeleted": directories_deleted,
+        "warningLines": warning_lines,
+        "otherLines": other_lines,
+    }
 
 
 def _chunk_remote_paths_for_targeted_scan(

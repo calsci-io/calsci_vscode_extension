@@ -3,6 +3,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import {
+  type ClearAllFilesResult,
   FIRMWARE_FLASH_PATHS_KEY,
   MAX_SYNC_FOLDER_HISTORY,
   POLL_INTERVAL_MS,
@@ -43,6 +44,7 @@ export class CalSciExtensionController implements vscode.Disposable {
   private readonly runInteractiveItem: vscode.StatusBarItem;
   private readonly runOutput: vscode.OutputChannel;
   private readonly syncOutput: vscode.OutputChannel;
+  private readonly cleanupOutput: vscode.OutputChannel;
   private readonly firmwareOutput: vscode.OutputChannel;
   private readonly workspaceOutput: vscode.OutputChannel;
   private readonly workspaceViewProvider: CalSciWorkspaceViewProvider;
@@ -92,6 +94,7 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     this.runOutput = vscode.window.createOutputChannel("Run Non-Interactive File");
     this.syncOutput = vscode.window.createOutputChannel("CalSci Folder Sync");
+    this.cleanupOutput = vscode.window.createOutputChannel("CalSci Clear All Files");
     this.firmwareOutput = vscode.window.createOutputChannel("CalSci Firmware Upload");
     this.workspaceOutput = vscode.window.createOutputChannel("CalSci Workspace");
     this.workspaceContentProvider = new CalSciWorkspaceContentProvider();
@@ -135,6 +138,7 @@ export class CalSciExtensionController implements vscode.Disposable {
       this.runInteractiveItem,
       this.runOutput,
       this.syncOutput,
+      this.cleanupOutput,
       this.firmwareOutput,
       this.workspaceOutput,
     );
@@ -192,6 +196,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.runInteractiveItem.dispose();
     this.runOutput.dispose();
     this.syncOutput.dispose();
+    this.cleanupOutput.dispose();
     this.firmwareOutput.dispose();
     this.workspaceOutput.dispose();
   }
@@ -215,6 +220,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand("calsci.syncFolder", async (uri?: vscode.Uri) => {
         await this.syncFolderCommand(uri);
+      }),
+      vscode.commands.registerCommand("calsci.clearAllFiles", async () => {
+        await this.clearAllFilesCommand();
       }),
       vscode.commands.registerCommand("calsci.refreshWorkspace", async () => {
         await this.refreshWorkspaceCommand();
@@ -656,6 +664,110 @@ export class CalSciExtensionController implements vscode.Disposable {
     const totalBytes = result.bytesSynced ?? 0;
     void vscode.window.showInformationMessage(
       `CalSci sync complete: ${fileCount} uploaded, ${deletedCount} deleted, ${skippedCount} skipped to ${result.remoteFolder} (${this.formatByteCount(totalBytes)} sent).`,
+    );
+  }
+
+  private async clearAllFilesCommand(): Promise<void> {
+    if (!this.backendReady) {
+      void vscode.window.showErrorMessage("CalSci backend is still initializing.");
+      return;
+    }
+    if (this.runInFlight) {
+      void vscode.window.showWarningMessage("CalSci is busy with a run operation.");
+      return;
+    }
+    if (this.operationInFlight > 0) {
+      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+      return;
+    }
+
+    const confirmation = await vscode.window.showWarningMessage(
+      "Delete all files from the selected CalSci device and recreate an empty boot.py?",
+      {
+        modal: true,
+        detail: "This mirrors the desktop app workflow and removes the current device workspace.",
+      },
+      "Delete All Files",
+    );
+    if (confirmation !== "Delete All Files") {
+      return;
+    }
+
+    let port: string;
+    try {
+      port = await this.resolvePortForOperation();
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      return;
+    }
+
+    const connected = await this.ensureSessionForPort(port, { force: true, notifyOnError: true, showTerminal: true });
+    if (!connected) {
+      return;
+    }
+
+    let result: ClearAllFilesResult;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `CalSci: Clearing all files on ${port}`,
+          cancellable: false,
+        },
+        async (progress) => {
+          this.cleanupOutput.clear();
+          this.cleanupOutput.appendLine(`CalSci clear-all on ${port}`);
+          this.cleanupOutput.appendLine("Workflow: desktop-style recursive cleanup + empty boot.py restore");
+          this.cleanupOutput.appendLine("");
+          this.cleanupOutput.show(false);
+
+          return this.backend.clearAllFiles(port, (line: string, isError: boolean) => {
+            const formatted = isError ? `[ERROR] ${line}` : line;
+            this.cleanupOutput.appendLine(formatted);
+            progress.report({ message: formatted.slice(0, 100) });
+          });
+        },
+      );
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Clear all files failed."));
+      return;
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+      await this.pollDevices();
+    }
+
+    this.cleanupOutput.show(false);
+
+    if (!result.ok) {
+      const detail = result.error ? ` ${result.error}` : "";
+      void vscode.window.showErrorMessage(`Clear all files failed on ${port}.${detail}`);
+      return;
+    }
+
+    this.workspaceViewProvider.invalidate();
+    if (this.shouldAutoScanWorkspace()) {
+      try {
+        await this.refreshWorkspaceCommand();
+      } catch {
+        // Ignore post-clean refresh failures; the clear operation already succeeded.
+      }
+    }
+
+    const filesDeleted = result.filesDeleted ?? 0;
+    const directoriesDeleted = result.directoriesDeleted ?? 0;
+    const warningsReported = result.warningsReported ?? 0;
+    if (warningsReported > 0) {
+      void vscode.window.showWarningMessage(
+        `CalSci clear complete: ${filesDeleted} files deleted, ${directoriesDeleted} folders deleted, ${warningsReported} warning(s). Empty boot.py restored.`,
+      );
+      return;
+    }
+
+    void vscode.window.showInformationMessage(
+      `CalSci clear complete: ${filesDeleted} files deleted, ${directoriesDeleted} folders deleted. Empty boot.py restored.`,
     );
   }
 

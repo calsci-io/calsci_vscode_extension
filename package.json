@@ -19,6 +19,7 @@
     "onCommand:calsci.runCurrentFile",
     "onCommand:calsci.runInteractiveFile",
     "onCommand:calsci.syncFolder",
+    "onCommand:calsci.clearAllFiles",
     "onCommand:calsci.refreshWorkspace",
     "onCommand:calsci.openHybridPanel"
   ],
@@ -85,6 +86,14 @@
       {
         "command": "calsci.syncFolder",
         "title": "CalSci: Select Folder"
+      },
+      {
+        "command": "calsci.clearAllFiles",
+        "title": "CalSci: Clear All Files",
+        "icon": {
+          "light": "media/reset.svg",
+          "dark": "media/reset.svg"
+        }
       },
       {
         "command": "calsci.refreshWorkspace",

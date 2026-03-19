@@ -8,6 +8,7 @@ import {
   BACKEND_TIMEOUT_BUFFER_SEC,
   type BackendHybridEventPayload,
   type BackendMessage,
+  type ClearAllFilesResult,
   type FirmwareFlashPaths,
   type FirmwareFlashResult,
   type PendingBackendRequest,
@@ -222,6 +223,22 @@ export class BackendServiceClient implements vscode.Disposable {
         localFolder,
         remoteFolder,
         deleteExtraneous,
+      },
+      {
+        stream: true,
+        onStream: onOutputLine,
+      },
+    );
+  }
+
+  public async clearAllFiles(
+    port: string,
+    onOutputLine: (line: string, isError: boolean) => void,
+  ): Promise<ClearAllFilesResult> {
+    return this.request<ClearAllFilesResult>(
+      "clear-all-files",
+      {
+        port,
       },
       {
         stream: true,

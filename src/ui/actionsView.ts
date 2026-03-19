@@ -73,6 +73,13 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
     command: "calsci.syncFolder",
     icon: "sync",
   },
+  {
+    id: "clearAllFiles",
+    label: "Clear All Files",
+    description: "Delete all files from CalSci root and recreate empty boot.py.",
+    command: "calsci.clearAllFiles",
+    icon: "trash",
+  },
 ];
 
 export class CalSciActionsViewProvider implements vscode.TreeDataProvider<CalSciActionItem> {

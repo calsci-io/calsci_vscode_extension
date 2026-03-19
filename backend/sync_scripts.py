@@ -26,6 +26,48 @@ def device_delete_file_script(remote_file: str) -> str:
     return "import os\n" f"os.remove({target})\n"
 
 
+def device_clear_all_script() -> str:
+    return (
+        "import os\n"
+        "def _join(_base, _name):\n"
+        "    return _base + '/' + _name if _base else _name\n"
+        "def _is_dir(_entry, _full):\n"
+        "    try:\n"
+        "        if len(_entry) > 1 and isinstance(_entry[1], int) and (_entry[1] & 0x4000):\n"
+        "            return True\n"
+        "    except:\n"
+        "        pass\n"
+        "    try:\n"
+        "        os.ilistdir(_full)\n"
+        "        return True\n"
+        "    except:\n"
+        "        return False\n"
+        "def _rmtree(_path):\n"
+        "    try:\n"
+        "        for _entry in os.ilistdir(_path):\n"
+        "            _name = _entry[0]\n"
+        "            _full = _join(_path, _name)\n"
+        "            if _is_dir(_entry, _full):\n"
+        "                _rmtree(_full)\n"
+        "                try:\n"
+        "                    os.rmdir(_full)\n"
+        "                    print('DIR_DEL:' + _full)\n"
+        "                except Exception as _exc:\n"
+        "                    print('DIR_ERR:' + _full + ' ' + str(_exc))\n"
+        "            else:\n"
+        "                try:\n"
+        "                    os.remove(_full)\n"
+        "                    print('FILE_DEL:' + _full)\n"
+        "                except Exception as _exc:\n"
+        "                    print('FILE_ERR:' + _full + ' ' + str(_exc))\n"
+        "    except Exception as _exc:\n"
+        "        print('ERR:' + str(_exc))\n"
+        "print('CLEANUP_START')\n"
+        "_rmtree('')\n"
+        "print('CLEANUP_DONE')\n"
+    )
+
+
 def device_list_file_sizes_script(remote_root: str) -> str:
     remote_root_json = json.dumps(remote_root)
     return (

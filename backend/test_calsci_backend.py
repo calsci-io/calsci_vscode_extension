@@ -364,6 +364,28 @@ class SyncFolderTests(unittest.TestCase):
         self.assertIn('print("OK")', script)
         self.assertNotIn("with open(", script)
 
+    def test_device_clear_all_script_matches_desktop_cleanup_markers(self) -> None:
+        script = backend._device_clear_all_script()
+        self.assertIn("CLEANUP_START", script)
+        self.assertIn("CLEANUP_DONE", script)
+        self.assertIn("FILE_DEL:", script)
+        self.assertIn("DIR_DEL:", script)
+        self.assertIn("_rmtree('')", script)
+
+    def test_parse_clear_all_output_collects_deletes_and_warnings(self) -> None:
+        parsed = backend._parse_clear_all_output(
+            "CLEANUP_START\n"
+            "FILE_DEL:boot.py\n"
+            "DIR_DEL:apps/demo\n"
+            "FILE_ERR:apps/demo.py busy\n"
+            "CLEANUP_DONE\n"
+        )
+        self.assertTrue(parsed["startSeen"])
+        self.assertTrue(parsed["doneSeen"])
+        self.assertEqual(parsed["filesDeleted"], ["boot.py"])
+        self.assertEqual(parsed["directoriesDeleted"], ["apps/demo"])
+        self.assertEqual(parsed["warningLines"], ["FILE_ERR:apps/demo.py busy"])
+
     def test_sync_device_relative_path_matches_desktop_upload_paths(self) -> None:
         self.assertEqual(backend._sync_device_relative_path("/db/test.json"), "db/test.json")
         self.assertEqual(backend._sync_device_relative_path("db/test.json"), "db/test.json")
@@ -1001,6 +1023,53 @@ class SyncFolderTests(unittest.TestCase):
             self.assertEqual(controller.raw_enter_calls, 2)
             self.assertEqual(controller.upload_calls, ["main.py", "main.py"])
             self.assertIn("after connection reset", "\n".join(progress_lines))
+
+    def test_clear_all_files_recreates_empty_boot_py_after_cleanup(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.port = "COM_TEST"
+                self.put_calls: list[tuple[str, bytes]] = []
+                self.exit_calls = 0
+                self._in_raw_repl = True
+
+            def sync_clear_all(self, timeout: float = 0.0) -> str:
+                self.timeout = timeout
+                return (
+                    "CLEANUP_START\n"
+                    "FILE_DEL:boot.py\n"
+                    "FILE_DEL:apps/demo.py\n"
+                    "DIR_DEL:apps\n"
+                    "FILE_ERR:busy.log busy\n"
+                    "CLEANUP_DONE\n"
+                )
+
+            def sync_put_content(self, remote_path: str, data: bytes, timeout: float | None = None) -> None:
+                self.put_calls.append((remote_path, data))
+
+            def sync_exit_raw_repl(self) -> None:
+                self.exit_calls += 1
+                self._in_raw_repl = False
+
+        progress_lines: list[str] = []
+        session = backend.PersistentSession(lambda _text: None, lambda _state: None, lambda _event: None)
+        controller = FakeController()
+        session._begin_exclusive_operation = lambda: (controller, False)  # type: ignore[method-assign]
+        session._end_exclusive_operation = lambda _paused: None  # type: ignore[method-assign]
+
+        result = session.clear_all_files(
+            port=None,
+            progress_callback=progress_lines.append,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["filesDeleted"], 2)
+        self.assertEqual(result["directoriesDeleted"], 1)
+        self.assertEqual(result["warningsReported"], 1)
+        self.assertTrue(result["bootCreated"])
+        self.assertEqual(controller.put_calls, [("boot.py", b"")])
+        self.assertEqual(controller.exit_calls, 1)
+        self.assertIn("Deleted file: boot.py", "\n".join(progress_lines))
+        self.assertIn("Creating empty boot.py…", "\n".join(progress_lines))
 
     def test_write_bytes_sends_full_payload_when_serial_write_is_partial(self) -> None:
         class FakeConn:

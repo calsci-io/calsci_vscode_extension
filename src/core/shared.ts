@@ -57,6 +57,16 @@ export type SyncFolderResult = {
   error?: string;
 };
 
+export type ClearAllFilesResult = {
+  ok: boolean;
+  port: string;
+  filesDeleted?: number;
+  directoriesDeleted?: number;
+  warningsReported?: number;
+  bootCreated?: boolean;
+  error?: string;
+};
+
 export type WorkspaceImportResult = {
   ok: boolean;
   port: string;
