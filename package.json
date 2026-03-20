@@ -21,6 +21,7 @@
     "onCommand:calsci.syncFolder",
     "onCommand:calsci.clearAllFiles",
     "onCommand:calsci.refreshWorkspace",
+    "onCommand:calsci.refreshTestingFolder",
     "onCommand:calsci.openHybridPanel"
   ],
   "main": "./out/extension.js",
@@ -43,6 +44,10 @@
         {
           "id": "calsci.workspaceView",
           "name": "CalSci Workspace"
+        },
+        {
+          "id": "calsci.testingView",
+          "name": "Testing Folder"
         }
       ]
     },
@@ -86,6 +91,14 @@
       {
         "command": "calsci.syncFolder",
         "title": "CalSci: Select Folder"
+      },
+      {
+        "command": "calsci.refreshTestingFolder",
+        "title": "CalSci: Refresh Testing Folder",
+        "icon": {
+          "light": "media/reset.svg",
+          "dark": "media/reset.svg"
+        }
       },
       {
         "command": "calsci.clearAllFiles",
@@ -142,6 +155,11 @@
         {
           "command": "calsci.refreshWorkspace",
           "when": "view == calsci.workspaceView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "calsci.refreshTestingFolder",
+          "when": "view == calsci.testingView",
           "group": "navigation@1"
         }
       ],

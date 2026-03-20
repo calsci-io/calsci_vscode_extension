@@ -34,6 +34,7 @@ import { BackendServiceClient } from "../backend/backendServiceClient";
 import { CalSciReplPseudoterminal } from "../ui/replTerminal";
 import { CalSciActionsViewProvider } from "../ui/actionsView";
 import { CalSciHybridPanel } from "../ui/hybridPanel";
+import { CalSciTestingFolderViewProvider } from "../ui/testingFolderView";
 import { CalSciWorkspaceContentProvider, createCalSciWorkspaceUri } from "../ui/workspaceContentProvider";
 import { CalSciWorkspaceViewProvider } from "../ui/workspaceView";
 
@@ -48,6 +49,7 @@ export class CalSciExtensionController implements vscode.Disposable {
   private readonly firmwareOutput: vscode.OutputChannel;
   private readonly workspaceOutput: vscode.OutputChannel;
   private readonly workspaceViewProvider: CalSciWorkspaceViewProvider;
+  private readonly testingFolderViewProvider: CalSciTestingFolderViewProvider;
   private readonly workspaceContentProvider: CalSciWorkspaceContentProvider;
 
   private pollTimer: NodeJS.Timeout | undefined;
@@ -102,6 +104,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       scanTree: async () => this.scanWorkspaceTree(),
       shouldAutoLoad: () => this.shouldAutoScanWorkspace(),
     });
+    this.testingFolderViewProvider = new CalSciTestingFolderViewProvider({
+      getWorkspaceFolder: () => vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === "file"),
+    });
     this.selectedPort = this.context.globalState.get<string>(SELECTED_PORT_KEY);
     this.setRunVisible(false);
 
@@ -118,6 +123,19 @@ export class CalSciExtensionController implements vscode.Disposable {
       vscode.workspace.registerTextDocumentContentProvider("calsci", this.workspaceContentProvider),
       vscode.window.registerTreeDataProvider("calsci.actionsView", new CalSciActionsViewProvider()),
       vscode.window.registerTreeDataProvider("calsci.workspaceView", this.workspaceViewProvider),
+      vscode.window.registerTreeDataProvider("calsci.testingView", this.testingFolderViewProvider),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => {
+        this.testingFolderViewProvider.invalidate();
+      }),
+      vscode.workspace.onDidCreateFiles(() => {
+        this.testingFolderViewProvider.invalidate();
+      }),
+      vscode.workspace.onDidDeleteFiles(() => {
+        this.testingFolderViewProvider.invalidate();
+      }),
+      vscode.workspace.onDidRenameFiles(() => {
+        this.testingFolderViewProvider.invalidate();
+      }),
       vscode.window.onDidCloseTerminal((terminal: vscode.Terminal) => {
         if (terminal !== this.replTerminal) {
           return;
@@ -160,6 +178,7 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     this.refreshStatus();
     this.workspaceViewProvider.invalidate();
+    this.testingFolderViewProvider.invalidate();
     const autoConnect = this.shouldAutoConnectOnDetect();
     await this.pollDevices({
       forceSessionConnect: autoConnect,
@@ -226,6 +245,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand("calsci.refreshWorkspace", async () => {
         await this.refreshWorkspaceCommand();
+      }),
+      vscode.commands.registerCommand("calsci.refreshTestingFolder", async () => {
+        this.testingFolderViewProvider.invalidate();
       }),
       vscode.commands.registerCommand("calsci.openWorkspaceFile", async (remotePath: string, port?: string) => {
         await this.openWorkspaceFileCommand(remotePath, port);
