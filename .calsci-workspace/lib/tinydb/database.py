@@ -1,1 +1,0 @@
-      return iter(self.table(self.default_table_name))

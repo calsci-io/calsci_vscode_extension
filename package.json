@@ -20,6 +20,7 @@
     "onCommand:calsci.runInteractiveFile",
     "onCommand:calsci.syncFolder",
     "onCommand:calsci.clearAllFiles",
+    "onCommand:calsci.flashFirmware",
     "onCommand:calsci.refreshWorkspace",
     "onCommand:calsci.refreshTestingFolder",
     "onCommand:calsci.openHybridPanel"
@@ -109,6 +110,10 @@
         }
       },
       {
+        "command": "calsci.flashFirmware",
+        "title": "CalSci: Flash Firmware"
+      },
+      {
         "command": "calsci.refreshWorkspace",
         "title": "CalSci: Refresh Workspace",
         "icon": {
@@ -138,19 +143,24 @@
           "group": "navigation@2"
         },
         {
-          "command": "calsci.runCurrentFile",
+          "command": "calsci.flashFirmware",
           "when": "view == calsci.actionsView",
           "group": "navigation@3"
         },
         {
-          "command": "calsci.runInteractiveFile",
+          "command": "calsci.runCurrentFile",
           "when": "view == calsci.actionsView",
           "group": "navigation@4"
         },
         {
-          "command": "calsci.openTerminal",
+          "command": "calsci.runInteractiveFile",
           "when": "view == calsci.actionsView",
           "group": "navigation@5"
+        },
+        {
+          "command": "calsci.openTerminal",
+          "when": "view == calsci.actionsView",
+          "group": "navigation@6"
         },
         {
           "command": "calsci.refreshWorkspace",

@@ -1,3 +1,0 @@
-g!")
-
-keyboard_example()

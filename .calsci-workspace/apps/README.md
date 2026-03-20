@@ -1,1 +1,0 @@
-s the display with `*_refresh.refresh(state=nav.current_state())`.

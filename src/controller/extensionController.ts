@@ -4,7 +4,6 @@ import * as vscode from "vscode";
 
 import {
   type ClearAllFilesResult,
-  FIRMWARE_FLASH_PATHS_KEY,
   MAX_SYNC_FOLDER_HISTORY,
   POLL_INTERVAL_MS,
   SELECTED_PORT_KEY,
@@ -231,6 +230,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       vscode.commands.registerCommand("calsci.softResetDevice", async () => {
         await this.softResetDevice();
       }),
+      vscode.commands.registerCommand("calsci.flashFirmware", async () => {
+        await this.uploadFirmwareFromPanel();
+      }),
       vscode.commands.registerCommand("calsci.runCurrentFile", async () => {
         await this.runCurrentFile();
       }),
@@ -282,8 +284,8 @@ export class CalSciExtensionController implements vscode.Disposable {
     }));
 
     const choice = await vscode.window.showQuickPick(picks, {
-      title: "Select CalSci Device",
-      placeHolder: "Choose a CalSci serial port",
+      title: "Select Device",
+      placeHolder: "Choose a detected device port",
       ignoreFocusOut: true,
     });
 
@@ -294,7 +296,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     await this.persistSelectedPort(choice.port);
     await this.ensureSessionForPort(choice.port, { force: true, notifyOnError: true, showTerminal: true });
     await this.pollDevices();
-    void vscode.window.showInformationMessage(`CalSci device selected: ${choice.port}`);
+    void vscode.window.showInformationMessage(`Device selected: ${choice.port}`);
   }
 
   private async softResetDevice(): Promise<void> {
@@ -311,7 +313,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     try {
       port = await this.resolvePortForOperation();
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
       return;
     }
 
@@ -419,7 +421,7 @@ export class CalSciExtensionController implements vscode.Disposable {
       try {
         port = await this.resolvePortForOperation();
       } catch (error) {
-        void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+        void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
         return;
       }
 
@@ -542,7 +544,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     try {
       port = await this.resolvePortForOperation();
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
       return;
     }
 
@@ -619,7 +621,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     try {
       port = await this.resolvePortForOperation();
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
       return;
     }
 
@@ -719,7 +721,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     try {
       port = await this.resolvePortForOperation();
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
       return;
     }
 
@@ -812,7 +814,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     try {
       port = await this.resolvePortForOperation();
     } catch (error) {
-      throw new Error(this.errorMessage(error, "No CalSci device selected."));
+      throw new Error(this.errorMessage(error, "No device selected."));
     }
 
     const connected = await this.ensureSessionForPort(port, { force: true, notifyOnError: true, showTerminal: false });
@@ -883,7 +885,7 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     const port = preferredPort?.trim() || this.selectedPort;
     if (!port) {
-      void vscode.window.showErrorMessage("No CalSci device selected.");
+      void vscode.window.showErrorMessage("No device selected.");
       return;
     }
 
@@ -945,7 +947,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     try {
       port = await this.resolvePortForOperation();
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
       return;
     }
 
@@ -1287,7 +1289,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     try {
       port = await this.resolvePortForOperation();
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
       return;
     }
 
@@ -1358,198 +1360,181 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
 
-    let port: string;
-    try {
-      port = await this.resolvePortForOperation();
-    } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "No CalSci device selected."));
-      return;
-    }
+    const preferredPort = this.selectedPort?.trim() ?? "";
 
     const confirm = await vscode.window.showWarningMessage(
-      `Flash bootloader, CalOS, and partition table on ${port}? This will stop the current CalSci session.`,
-      { modal: true },
+      "Flash the bundled CalSci firmware to the detected ESP device? This will stop the current CalSci session and replace all onboard firmware images.",
+      {
+        modal: true,
+        detail: preferredPort
+          ? `The extension will auto-detect the current ESP port and prefer the selected port ${preferredPort} when it is available.`
+          : "The extension will auto-detect the current ESP port, then flash bootloader, partition table, OTA data, and CalOS.",
+      },
       "Yes",
     );
     if (confirm !== "Yes") {
       return;
     }
 
-    let firmwarePaths: FirmwareFlashPaths | undefined;
+    let firmwarePaths: FirmwareFlashPaths;
     try {
       firmwarePaths = await this.resolveFirmwareFlashPaths();
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "Firmware upload aborted."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Firmware flash aborted."));
       return;
     }
-    if (!firmwarePaths) {
-      return;
-    }
-
-    await this.rememberFirmwareFlashPaths(firmwarePaths);
 
     let result: FirmwareFlashResult;
     try {
-      this.operationInFlight += 1;
-      this.refreshStatus();
-      result = await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: `CalSci: Uploading firmware to ${port}`,
-          cancellable: false,
-        },
-        async (progress) => {
-          this.firmwareOutput.clear();
-          this.firmwareOutput.appendLine(`CalSci firmware upload target: ${port}`);
-          this.firmwareOutput.appendLine(`Bootloader:      ${firmwarePaths.bootloaderPath}`);
-          this.firmwareOutput.appendLine(`CalOS:           ${firmwarePaths.calOsPath}`);
-          this.firmwareOutput.appendLine(`Partition table: ${firmwarePaths.partitionTablePath}`);
-          this.firmwareOutput.appendLine("");
-          this.firmwareOutput.show(false);
-
-          return this.backend.flashFirmware(port, firmwarePaths, (line: string, isError: boolean) => {
-            const formatted = isError ? `[ERROR] ${line}` : line;
-            this.firmwareOutput.appendLine(formatted);
-            progress.report({ message: formatted.slice(0, 100) });
-          });
-        },
-      );
+      result = await this.runFirmwareFlashAttempt({
+        port: preferredPort,
+        firmwarePaths,
+        manualBootloader: false,
+        progressTitle: "CalSci: Flashing bundled firmware to detected ESP device",
+        clearOutput: true,
+      });
     } catch (error) {
-      void vscode.window.showErrorMessage(this.errorMessage(error, "Firmware upload failed."));
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Firmware flash failed."));
       return;
-    } finally {
-      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
-      this.refreshStatus();
+    }
+
+    if (!result.ok && this.isLikelyFirmwareConnectError(result.error)) {
+      const retry = await vscode.window.showWarningMessage(
+        `Automatic firmware flashing could not connect to ${result.port || preferredPort || "the detected device"}. Put CalSci into bootloader mode manually, then retry.`,
+        {
+          modal: true,
+          detail: "Hold BOOT, tap RESET, then release BOOT. The extension will auto-detect the current ESP port and retry after bootloader confirmation.",
+        },
+        "Retry Flash",
+      );
+
+      if (retry === "Retry Flash") {
+        try {
+          result = await this.runFirmwareFlashAttempt({
+            port: result.port || preferredPort,
+            firmwarePaths,
+            manualBootloader: true,
+            progressTitle: "CalSci: Waiting for bootloader mode on detected ESP device",
+            clearOutput: false,
+          });
+        } catch (error) {
+          void vscode.window.showErrorMessage(this.errorMessage(error, "Manual bootloader firmware flash failed."));
+          return;
+        }
+      }
     }
 
     this.firmwareOutput.show(false);
-    await this.persistSelectedPort(result.port || port);
+    await this.persistSelectedPort(result.port || preferredPort || undefined);
     await this.pollDevices();
     if (result.ok) {
       await this.ensureSessionForSelection({ force: true, notifyOnError: false, showTerminal: false });
-      const flashedPort = result.port || port;
-      if (flashedPort !== port) {
-        void vscode.window.showInformationMessage(`Firmware upload complete. Device port changed to ${flashedPort}.`);
+      const flashedPort = result.port || preferredPort;
+      if (preferredPort && flashedPort !== preferredPort) {
+        void vscode.window.showInformationMessage(`Firmware flash complete. Device port changed to ${flashedPort}.`);
       } else {
-        void vscode.window.showInformationMessage(`Firmware upload complete on ${flashedPort}.`);
+        void vscode.window.showInformationMessage(`Firmware flash complete on ${flashedPort}.`);
       }
       return;
     }
 
     const detail = result.error ? ` ${result.error}` : "";
-    void vscode.window.showErrorMessage(`Firmware upload failed on ${result.port || port}.${detail}`);
+    void vscode.window.showErrorMessage(`Firmware flash failed on ${result.port || preferredPort || "the detected device"}.${detail}`);
   }
 
-  private async resolveFirmwareFlashPaths(): Promise<FirmwareFlashPaths | undefined> {
-    const remembered = await this.loadRememberedFirmwareFlashPaths();
-
-    const bootloaderPath = await this.pickFirmwareImagePath("Bootloader", remembered.bootloaderPath);
-    if (!bootloaderPath) {
-      return undefined;
-    }
-
-    const calOsPath = await this.pickFirmwareImagePath("CalOS", remembered.calOsPath);
-    if (!calOsPath) {
-      return undefined;
-    }
-
-    const partitionTablePath = await this.pickFirmwareImagePath("Partition Table", remembered.partitionTablePath);
-    if (!partitionTablePath) {
-      return undefined;
-    }
-
-    return {
-      bootloaderPath,
-      calOsPath,
-      partitionTablePath,
-    };
-  }
-
-  private async loadRememberedFirmwareFlashPaths(): Promise<Partial<FirmwareFlashPaths>> {
-    const stored = this.context.globalState.get<Partial<FirmwareFlashPaths>>(FIRMWARE_FLASH_PATHS_KEY) ?? {};
-    const normalized: Partial<FirmwareFlashPaths> = {};
-
-    for (const key of ["bootloaderPath", "calOsPath", "partitionTablePath"] as const) {
-      const candidate = stored[key];
-      if (typeof candidate !== "string" || candidate.trim().length === 0) {
-        continue;
-      }
-      const resolved = path.resolve(candidate);
-      if (await this.isFilePath(resolved)) {
-        normalized[key] = resolved;
-      }
-    }
-
-    if (
-      normalized.bootloaderPath !== stored.bootloaderPath
-      || normalized.calOsPath !== stored.calOsPath
-      || normalized.partitionTablePath !== stored.partitionTablePath
-    ) {
-      await this.context.globalState.update(FIRMWARE_FLASH_PATHS_KEY, normalized);
-    }
-
-    return normalized;
-  }
-
-  private async rememberFirmwareFlashPaths(paths: FirmwareFlashPaths): Promise<void> {
-    await this.context.globalState.update(FIRMWARE_FLASH_PATHS_KEY, {
-      bootloaderPath: path.resolve(paths.bootloaderPath),
-      calOsPath: path.resolve(paths.calOsPath),
-      partitionTablePath: path.resolve(paths.partitionTablePath),
-    } satisfies FirmwareFlashPaths);
-  }
-
-  private async pickFirmwareImagePath(label: string, rememberedPath?: string): Promise<string | undefined> {
-    const remembered = rememberedPath && await this.isFilePath(rememberedPath) ? path.resolve(rememberedPath) : undefined;
-
-    if (remembered) {
-      const choice = await vscode.window.showQuickPick(
-        [
-          {
-            label: `$(history) Use remembered ${label}`,
-            description: remembered,
-            action: "remember" as const,
-          },
-          {
-            label: `$(file) Browse for ${label}`,
-            description: "Choose a different .bin file",
-            action: "browse" as const,
-          },
-        ],
+  private async runFirmwareFlashAttempt(options: {
+    port: string;
+    firmwarePaths: FirmwareFlashPaths;
+    manualBootloader: boolean;
+    progressTitle: string;
+    clearOutput: boolean;
+  }): Promise<FirmwareFlashResult> {
+    const { port, firmwarePaths, manualBootloader, progressTitle, clearOutput } = options;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      return await vscode.window.withProgress(
         {
-          title: `CalSci: Select ${label} Image`,
-          placeHolder: remembered,
-          ignoreFocusOut: true,
+          location: vscode.ProgressLocation.Notification,
+          title: progressTitle,
+          cancellable: false,
+        },
+        async (progress) => {
+          if (clearOutput) {
+            this.firmwareOutput.clear();
+          } else {
+            this.firmwareOutput.appendLine("");
+            this.firmwareOutput.appendLine("----");
+          }
+          this.firmwareOutput.appendLine(`CalSci firmware flash target: ${port || "auto-detect ESP port"}`);
+          this.firmwareOutput.appendLine(`Mode:            ${manualBootloader ? "manual bootloader retry" : "automatic USB reset"}`);
+          this.firmwareOutput.appendLine(`Bootloader:      ${firmwarePaths.bootloaderPath}`);
+          this.firmwareOutput.appendLine(`Partition table: ${firmwarePaths.partitionTablePath}`);
+          this.firmwareOutput.appendLine(`OTA data:        ${firmwarePaths.otaDataPath}`);
+          this.firmwareOutput.appendLine(`CalOS:           ${firmwarePaths.calOsPath}`);
+          this.firmwareOutput.appendLine("");
+          this.firmwareOutput.show(false);
+
+          return this.backend.flashFirmware(
+            port,
+            firmwarePaths,
+            (line: string, isError: boolean) => {
+              const formatted = isError ? `[ERROR] ${line}` : line;
+              this.firmwareOutput.appendLine(formatted);
+              progress.report({ message: formatted.slice(0, 100) });
+            },
+            { manualBootloader },
+          );
         },
       );
-      if (!choice) {
-        return undefined;
-      }
-      if (choice.action === "remember") {
-        return remembered;
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+    }
+  }
+
+  private async resolveFirmwareFlashPaths(): Promise<FirmwareFlashPaths> {
+    const firmwareRoot = path.join(this.context.extensionPath, "firmware", "esp32s3", "latest");
+    const firmwarePaths: FirmwareFlashPaths = {
+      bootloaderPath: path.join(firmwareRoot, "bootloader.bin"),
+      partitionTablePath: path.join(firmwareRoot, "partition-table.bin"),
+      otaDataPath: path.join(firmwareRoot, "ota_data_initial.bin"),
+      calOsPath: path.join(firmwareRoot, "micropython.bin"),
+    };
+
+    const requiredPaths: Array<[string, string]> = [
+      ["bootloader", firmwarePaths.bootloaderPath],
+      ["partition table", firmwarePaths.partitionTablePath],
+      ["OTA data", firmwarePaths.otaDataPath],
+      ["CalOS", firmwarePaths.calOsPath],
+    ];
+    for (const [label, candidatePath] of requiredPaths) {
+      const resolvedPath = path.resolve(candidatePath);
+      if (!await this.isFilePath(resolvedPath)) {
+        throw new Error(`Bundled ${label} image not found: ${resolvedPath}. Reinstall or update the CalSci extension package.`);
       }
     }
 
-    const workspaceFolder = vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === "file");
-    const defaultUri = remembered ? vscode.Uri.file(remembered) : workspaceFolder?.uri;
-    const picked = await vscode.window.showOpenDialog({
-      canSelectFiles: true,
-      canSelectFolders: false,
-      canSelectMany: false,
-      defaultUri,
-      openLabel: `Select ${label}`,
-      title: `CalSci: Select ${label} Image`,
-      filters: { Binary: ["bin"] },
-    });
-    if (!picked || picked.length === 0) {
-      return undefined;
+    return firmwarePaths;
+  }
+
+  private isLikelyFirmwareConnectError(errorText: string | undefined): boolean {
+    if (!errorText) {
+      return false;
     }
 
-    const selectedPath = path.resolve(picked[0].fsPath);
-    if (path.extname(selectedPath).toLowerCase() !== ".bin") {
-      throw new Error(`${label} must be a .bin file.`);
-    }
-    return selectedPath;
+    const lowered = errorText.toLowerCase();
+    return [
+      "write timeout",
+      "failed to connect",
+      "timed out waiting for packet header",
+      "serial exception",
+      "could not open port",
+      "device not found",
+      "no serial data received",
+      "bootloader signal not detected",
+      "bootloader confirmation timeout",
+    ].some((needle) => lowered.includes(needle));
   }
 
   private applyHybridSnapshot(snapshot: HybridSnapshotResult): void {
@@ -1590,7 +1575,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     await this.pollDevices();
 
     if (this.devices.length === 0) {
-      throw new Error("No CalSci device found.");
+      throw new Error("No device found.");
     }
 
     const selected = this.devices.find((device) => device.port === this.selectedPort);
@@ -1610,7 +1595,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     }));
 
     const choice = await vscode.window.showQuickPick(picks, {
-      title: "Select CalSci Device",
+      title: "Select Device",
       placeHolder: "Choose device for this operation",
       ignoreFocusOut: true,
     });
@@ -1902,7 +1887,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
 
     if (!this.selectedPort) {
-      this.setNoDeviceStatus("No CalSci device selected.");
+      this.setNoDeviceStatus("No device selected.");
       return;
     }
 

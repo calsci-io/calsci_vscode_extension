@@ -1,1 +1,0 @@
-ponse(text=str(e), status_code=0)

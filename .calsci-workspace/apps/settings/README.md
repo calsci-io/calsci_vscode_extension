@@ -1,1 +1,0 @@
-eens render with `menu_refresh` or `form_refresh` and pass `nav.current_state()` into the refresh call.

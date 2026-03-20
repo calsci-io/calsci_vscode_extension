@@ -1,6 +1,5 @@
 export const SELECTED_PORT_KEY = "selectedPort";
 export const SYNC_FOLDER_HISTORY_KEY = "syncFolderHistory";
-export const FIRMWARE_FLASH_PATHS_KEY = "firmwareFlashPaths";
 export const POLL_INTERVAL_MS = 1000;
 export const BACKEND_TIMEOUT_BUFFER_SEC = 30;
 export const SESSION_RETRY_BACKOFF_MS = 3000;
@@ -108,6 +107,7 @@ export type FirmwareFlashPaths = {
   bootloaderPath: string;
   calOsPath: string;
   partitionTablePath: string;
+  otaDataPath: string;
 };
 
 export type FirmwareFlashResult = {
@@ -116,6 +116,7 @@ export type FirmwareFlashResult = {
   bootloaderPath: string;
   calOsPath: string;
   partitionTablePath: string;
+  otaDataPath: string;
   error?: string;
 };
 

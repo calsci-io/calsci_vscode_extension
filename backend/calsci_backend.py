@@ -68,11 +68,9 @@ PORT_OPEN_SETTLE_SEC = 0.12
 READER_PAUSE_WAIT_SEC = 2.0
 HYBRID_HELPER_COMMAND_TIMEOUT_SEC = 1.2
 HYBRID_HELPER_ENABLE_TIMEOUT_SEC = 1.5
-# Keep helper refreshes responsive without pushing the REPL helper hard enough to
-# overlap commands on slower frames.
-HYBRID_HELPER_POLL_TIMEOUT_SEC = 0.2
-HYBRID_HELPER_POLL_INTERVAL_SEC = 0.005
-HYBRID_HELPER_REPL_QUIET_SEC = 0.8
+HYBRID_HELPER_POLL_TIMEOUT_SEC = 0.45
+HYBRID_HELPER_POLL_INTERVAL_SEC = 0.025
+HYBRID_HELPER_REPL_QUIET_SEC = 2.5
 SOFT_RESET_BREAK_DELAY_SEC = 0.05
 SOFT_RESET_TIMEOUT_FALLBACK_SEC = 2.5
 SYNC_DEVICE_COMMAND_TIMEOUT_SEC = 15.0
@@ -108,9 +106,11 @@ FIRMWARE_FLASH_BEFORE = "usb-reset"
 FIRMWARE_FLASH_AFTER = "hard-reset"
 FIRMWARE_FLASH_BOOTLOADER_OFFSET = "0x0"
 FIRMWARE_FLASH_PARTITION_OFFSET = "0x8000"
+FIRMWARE_FLASH_OTA_DATA_OFFSET = "0xe000"
 FIRMWARE_FLASH_CALOS_OFFSET = "0x10000"
 FIRMWARE_FLASH_PORT_RESCAN_TIMEOUT_SEC = 12.0
 FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC = 0.5
+FIRMWARE_FLASH_MANUAL_BOOT_TIMEOUT_SEC = 60.0
 ESP32_KEYWORDS = ("Espressif", CALSCI_PRODUCT)
 SOFT_RESET_REBOOT_MARKERS = (
     b"soft reboot",
@@ -3227,7 +3227,7 @@ class JobDispatcher:
 
         try:
             if job.command == "scan":
-                return {"ok": True, "devices": list_calsci_ports()}
+                return {"ok": True, "devices": list_detected_esp_ports()}
             if job.command == "session.open":
                 return self._session.open(port=str(args["port"]))
             if job.command == "session.close":
@@ -3331,6 +3331,8 @@ class JobDispatcher:
                     bootloader_path=str(args["bootloaderPath"]),
                     calos_path=str(args["calOsPath"]),
                     partition_table_path=str(args["partitionTablePath"]),
+                    ota_data_path=str(args["otaDataPath"]),
+                    manual_bootloader=bool(args.get("manualBootloader", False)),
                     progress_callback=(
                         lambda line, req_id=job.request_id: _service_emit(
                             {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
@@ -3462,6 +3464,51 @@ def _build_esptool_multi_write_cmd(
     return cmd
 
 
+def _build_esptool_boot_cmd(
+    port: str,
+    baudrate: int = FIRMWARE_FLASH_BAUDRATE,
+    before: str = "no-reset",
+    after: str = "no-reset",
+    chip: str = FIRMWARE_FLASH_CHIP,
+    connect_attempts: int = FIRMWARE_FLASH_CONNECT_ATTEMPTS,
+) -> list[str]:
+    if importlib.util.find_spec("esptool") is not None:
+        return [
+            sys.executable,
+            "-m",
+            "esptool",
+            "--chip",
+            chip,
+            "--port",
+            port,
+            "--baud",
+            str(baudrate),
+            "--connect-attempts",
+            str(connect_attempts),
+            "--before",
+            before,
+            "--after",
+            after,
+            "chip-id",
+        ]
+    return [
+        "esptool",
+        "--chip",
+        chip,
+        "--port",
+        port,
+        "--baud",
+        str(baudrate),
+        "--connect-attempts",
+        str(connect_attempts),
+        "--before",
+        before,
+        "--after",
+        after,
+        "chip-id",
+    ]
+
+
 def _run_esptool(cmd: list[str], progress_callback: Callable[[str], None] | None = None) -> None:
     if progress_callback is not None:
         progress_callback(f"Running: {' '.join(cmd)}")
@@ -3552,12 +3599,47 @@ def _wait_for_esp_port(preferred: str, progress_callback: Callable[[str], None] 
     return preferred
 
 
+def _detect_initial_flash_port(
+    preferred: str | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str:
+    preferred_port = str(preferred or "").strip()
+    ports = _scan_esp_ports()
+
+    if preferred_port:
+        if preferred_port in ports:
+            if progress_callback is not None:
+                progress_callback(f"Using preferred port {preferred_port}")
+            return preferred_port
+        if ports:
+            if progress_callback is not None:
+                progress_callback(f"Preferred port {preferred_port} not detected; using {ports[0]}")
+            return ports[0]
+        if progress_callback is not None:
+            progress_callback(f"No ESP port detected; trying preferred port {preferred_port}")
+        return preferred_port
+
+    if ports:
+        if progress_callback is not None:
+            progress_callback(f"Using detected ESP port {ports[0]}")
+        return ports[0]
+
+    raise ControllerError("No ESP device detected for firmware flashing.")
+
+
 def _run_esptool_with_connect_retries(
     image_pairs: list[tuple[str, Path]],
     port: str,
     progress_callback: Callable[[str], None] | None = None,
+    before_modes: tuple[str, ...] | None = None,
+    after_mode: str = FIRMWARE_FLASH_AFTER,
 ) -> str:
-    before_modes = ("default-reset", FIRMWARE_FLASH_BEFORE, "usb-reset")
+    if before_modes is None:
+        ordered_modes: list[str] = []
+        for mode in ("default-reset", FIRMWARE_FLASH_BEFORE, "usb-reset"):
+            if mode and mode not in ordered_modes:
+                ordered_modes.append(mode)
+        before_modes = tuple(ordered_modes)
     last_error: Exception | None = None
     attempt = 0
 
@@ -3572,7 +3654,7 @@ def _run_esptool_with_connect_retries(
                     image_pairs=image_pairs,
                     baudrate=baud,
                     before=before_mode,
-                    after=FIRMWARE_FLASH_AFTER,
+                    after=after_mode,
                 )
                 _run_esptool(cmd, progress_callback=progress_callback)
                 return _wait_for_esp_port(port, progress_callback=progress_callback)
@@ -3588,94 +3670,152 @@ def _run_esptool_with_connect_retries(
     raise last_error
 
 
+def _confirm_manual_bootloader(
+    port: str,
+    progress_callback: Callable[[str], None] | None = None,
+    timeout_seconds: float = FIRMWARE_FLASH_MANUAL_BOOT_TIMEOUT_SEC,
+) -> str:
+    deadline = time.time() + max(1.0, timeout_seconds)
+    last_error = ""
+    if progress_callback is not None:
+        progress_callback("Waiting for manual bootloader confirmation (hold BOOT, tap RESET, release BOOT)...")
+
+    missing_seen = False
+    while time.time() < deadline:
+        ports = _scan_esp_ports()
+        if port not in ports:
+            missing_seen = True
+        if missing_seen and ports:
+            if port not in ports:
+                if progress_callback is not None and ports[0] != port:
+                    progress_callback(f"Port changed: {port} -> {ports[0]}")
+                port = ports[0]
+            break
+        time.sleep(FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC)
+
+    if not missing_seen:
+        raise ControllerError("Bootloader signal not detected (port did not reset)")
+
+    while time.time() < deadline:
+        try:
+            boot_cmd = _build_esptool_boot_cmd(port=port, before="no-reset", after="no-reset")
+            _run_esptool(boot_cmd, progress_callback=None)
+            if progress_callback is not None:
+                progress_callback("Bootloader confirmed.")
+            return _wait_for_esp_port(port, progress_callback=progress_callback)
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC)
+
+    if last_error:
+        raise ControllerError(f"Bootloader confirmation timeout. {last_error[:160]}")
+    raise ControllerError("Bootloader confirmation timeout.")
+
+
 def flash_firmware_bundle(
     port: str,
     bootloader_path: str,
     calos_path: str,
     partition_table_path: str,
+    ota_data_path: str,
+    manual_bootloader: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    resolved_port = str(port or "").strip()
-    if not resolved_port:
-        return {
-            "ok": False,
-            "port": "",
-            "bootloaderPath": bootloader_path,
-            "calOsPath": calos_path,
-            "partitionTablePath": partition_table_path,
-            "error": "No port provided.",
-        }
+    requested_port = str(port or "").strip()
 
     images = {
         "bootloader": Path(bootloader_path).expanduser().resolve(),
         "calos": Path(calos_path).expanduser().resolve(),
         "partition table": Path(partition_table_path).expanduser().resolve(),
+        "ota data": Path(ota_data_path).expanduser().resolve(),
     }
     for label, image_path in images.items():
         if not image_path.exists():
             return {
                 "ok": False,
-                "port": resolved_port,
+                "port": requested_port,
                 "bootloaderPath": str(images["bootloader"]),
                 "calOsPath": str(images["calos"]),
                 "partitionTablePath": str(images["partition table"]),
+                "otaDataPath": str(images["ota data"]),
                 "error": f"{label.capitalize()} image not found: {image_path}",
             }
         if not image_path.is_file():
             return {
                 "ok": False,
-                "port": resolved_port,
+                "port": requested_port,
                 "bootloaderPath": str(images["bootloader"]),
                 "calOsPath": str(images["calos"]),
                 "partitionTablePath": str(images["partition table"]),
+                "otaDataPath": str(images["ota data"]),
                 "error": f"{label.capitalize()} path is not a file: {image_path}",
             }
 
     image_pairs = [
         (FIRMWARE_FLASH_BOOTLOADER_OFFSET, images["bootloader"]),
         (FIRMWARE_FLASH_PARTITION_OFFSET, images["partition table"]),
+        (FIRMWARE_FLASH_OTA_DATA_OFFSET, images["ota data"]),
         (FIRMWARE_FLASH_CALOS_OFFSET, images["calos"]),
     ]
 
     try:
-        if progress_callback is not None:
+        flash_port = _detect_initial_flash_port(requested_port, progress_callback=progress_callback)
+        if manual_bootloader:
+            if progress_callback is not None:
+                progress_callback("Manual bootloader mode requested.")
+            flash_port = _confirm_manual_bootloader(flash_port, progress_callback=progress_callback)
+        elif progress_callback is not None:
             progress_callback("Using automatic USB reset mode.")
-            progress_callback("Flashing bootloader + partition table + CalOS...")
-        flashed_port = _run_esptool_with_connect_retries(image_pairs, resolved_port, progress_callback=progress_callback)
+
         if progress_callback is not None:
-            progress_callback(f"Firmware upload complete on {flashed_port}")
+            progress_callback("Flashing bootloader + partition table + OTA data + CalOS...")
+        flashed_port = _run_esptool_with_connect_retries(
+            image_pairs,
+            flash_port,
+            progress_callback=progress_callback,
+            before_modes=("no-reset",) if manual_bootloader else None,
+        )
+        if progress_callback is not None:
+            progress_callback(f"Firmware flash complete on {flashed_port}")
         return {
             "ok": True,
             "port": flashed_port,
             "bootloaderPath": str(images["bootloader"]),
             "calOsPath": str(images["calos"]),
             "partitionTablePath": str(images["partition table"]),
+            "otaDataPath": str(images["ota data"]),
         }
     except Exception as exc:
         return {
             "ok": False,
-            "port": resolved_port,
+            "port": requested_port,
             "bootloaderPath": str(images["bootloader"]),
             "calOsPath": str(images["calos"]),
             "partitionTablePath": str(images["partition table"]),
+            "otaDataPath": str(images["ota data"]),
             "error": str(exc),
         }
 
 
-def list_calsci_ports() -> list[dict[str, str]]:
+def list_detected_esp_ports() -> list[dict[str, str]]:
+    current_ports = {str(port.device or ""): port for port in list_ports.comports()}
     devices: list[dict[str, str]] = []
-    for port in list_ports.comports():
-        product = (port.product or "").strip()
-        if product != CALSCI_PRODUCT:
-            continue
+
+    for device in _scan_esp_ports():
+        port = current_ports.get(device)
+        product = ""
+        description = ""
+        if port is not None:
+            product = (port.product or port.manufacturer or "").strip()
+            description = (port.description or "").strip()
         devices.append(
             {
-                "port": port.device,
+                "port": device,
                 "product": product,
-                "description": (port.description or "").strip(),
+                "description": description,
             }
         )
-    devices.sort(key=lambda item: item["port"])
+
     return devices
 
 
@@ -4439,7 +4579,7 @@ def main() -> int:
     if args.command == "serve":
         return serve_loop()
     if args.command == "scan":
-        return emit({"ok": True, "devices": list_calsci_ports()}, getattr(args, "json", False))
+        return emit({"ok": True, "devices": list_detected_esp_ports()}, getattr(args, "json", False))
     if args.command == "soft-reset":
         return emit(run_soft_reset(port=args.port, timeout_seconds=args.timeout), getattr(args, "json", False))
     if args.command == "run-file":

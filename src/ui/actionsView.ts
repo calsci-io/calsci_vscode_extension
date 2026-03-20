@@ -39,6 +39,13 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
     icon: "debug-restart",
   },
   {
+    id: "flashFirmware",
+    label: "Flash Firmware",
+    description: "Flash the bundled latest firmware to the selected CalSci device.",
+    command: "calsci.flashFirmware",
+    icon: "arrow-up",
+  },
+  {
     id: "runCurrentFile",
     label: "Run Non-Interactive",
     description: "Run the active Python file through raw REPL.",

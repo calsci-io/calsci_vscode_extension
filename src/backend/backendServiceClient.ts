@@ -280,6 +280,9 @@ export class BackendServiceClient implements vscode.Disposable {
     port: string,
     paths: FirmwareFlashPaths,
     onOutputLine: (line: string, isError: boolean) => void,
+    options?: {
+      manualBootloader?: boolean;
+    },
   ): Promise<FirmwareFlashResult> {
     return this.request<FirmwareFlashResult>(
       "firmware.flash",
@@ -288,6 +291,8 @@ export class BackendServiceClient implements vscode.Disposable {
         bootloaderPath: paths.bootloaderPath,
         calOsPath: paths.calOsPath,
         partitionTablePath: paths.partitionTablePath,
+        otaDataPath: paths.otaDataPath,
+        manualBootloader: Boolean(options?.manualBootloader),
       },
       {
         stream: true,

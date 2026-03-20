@@ -1,1 +1,0 @@
-rom the root menu. Apps commonly use `menu`, `form`, or `text` buffers and render with their respective `*_refresh` uploaders.
