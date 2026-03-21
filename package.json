@@ -1,15 +1,38 @@
 {
   "name": "calsci-vscode-extension",
   "displayName": "CalSci",
-  "description": "CalSci device extension with a persistent backend-owned REPL session.",
-  "version": "0.0.1",
-  "publisher": "calsci",
-  "license": "UNLICENSED",
+  "description": "Run MicroPython on CalSci with a persistent REPL, interactive and non-interactive execution, workspace sync, and bundled firmware flashing.",
+  "version": "0.1.0",
+  "publisher": "calsci-io",
+  "author": "Rupesh Verma",
+  "license": "MIT",
+  "icon": "media/calsci-marketplace-icon.png",
+  "homepage": "https://calsci.io",
+  "bugs": {
+    "url": "https://calsci.io",
+    "email": "contact@calsci.io"
+  },
+  "galleryBanner": {
+    "color": "#050505",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "calsci",
+    "micropython",
+    "serial",
+    "repl",
+    "embedded",
+    "firmware",
+    "esp32",
+    "python",
+    "usb",
+    "calculator"
   ],
   "activationEvents": [
     "onStartupFinished",
@@ -25,7 +48,19 @@
     "onCommand:calsci.refreshTestingFolder",
     "onCommand:calsci.openHybridPanel"
   ],
-  "main": "./out/extension.js",
+  "main": "out/extension.js",
+  "files": [
+    "out/**",
+    "backend/**",
+    "firmware/**",
+    "runtime/**",
+    "media/**",
+    "package.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "SUPPORT.md"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -211,12 +246,20 @@
     }
   },
   "scripts": {
+    "stage-runtime": "python3 scripts/stage_runtime.py",
+    "build": "npm run stage-runtime && npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run build",
+    "package:vsix": "npm run build && npx @vscode/vsce package --allow-missing-repository --no-dependencies --no-yarn"
+  },
+  "overrides": {
+    "cheerio": "1.0.0-rc.12"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.26.0",
     "typescript": "^5.6.3"
   }
 }

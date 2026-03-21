@@ -25,6 +25,13 @@ class CalSciActionItem extends vscode.TreeItem {
 
 const ACTIONS: readonly CalSciActionDefinition[] = [
   {
+    id: "selectDevice",
+    label: "Select Device",
+    description: "Choose the active CalSci serial device before using CalSci commands.",
+    command: "calsci.selectDevice",
+    icon: "plug",
+  },
+  {
     id: "openHybridPanel",
     label: "Open Hybrid Panel",
     description: "Open the CalSci keypad and sync controls.",
@@ -65,13 +72,6 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
     description: "Show the persistent CalSci REPL terminal.",
     command: "calsci.openTerminal",
     icon: "chip",
-  },
-  {
-    id: "selectDevice",
-    label: "Select Device",
-    description: "Choose the active CalSci serial device.",
-    command: "calsci.selectDevice",
-    icon: "plug",
   },
   {
     id: "syncFolder",

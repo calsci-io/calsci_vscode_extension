@@ -1,37 +1,80 @@
-# CalSci VS Code Extension
+# CalSci for VS Code
 
-CalSci extension for the desktop-to-extension migration. Step 1 is achieved, and the Step 2 helper-path hybrid panel is now implemented in the extension pending live verification. Phased status is tracked in [MIGRATION.md](./MIGRATION.md).
+CalSci turns Visual Studio Code into a desktop control surface for the CalSci device. Run MicroPython code directly from the active editor, keep a persistent REPL open for terminal-level computation, sync files to the device, inspect the device workspace, and flash bundled firmware from one extension.
 
-## Current scope
+## Highlights
 
-- Persistent backend-owned serial session.
-- In-extension REPL terminal backed by a VS Code `Pseudoterminal`.
-- Existing V1 commands preserved:
-  - `CalSci: Select Device`
-  - `CalSci: Soft Reset Device`
-  - `CalSci: Run Non-Interactive File`
-  - `CalSci: Run Interactive File`
-- `CalSci: Open Hybrid Panel` for helper-path display mirroring and keypad injection.
+- Persistent backend-owned REPL session inside VS Code.
+- Integrated CalSci terminal backed by a VS Code `Pseudoterminal`.
+- Run the active Python file non-interactively over raw REPL without permanently uploading it to the device.
+- Run the active Python file interactively through the normal REPL so `input()` and live terminal interaction work as expected.
+- Scan for the connected CalSci device and keep a single extension-owned serial session active.
+- Sync a local folder to the device workspace.
+- Browse and open files from the device workspace view.
+- Clear all user files from the device workspace.
+- Use the hybrid panel for helper-path display mirroring and keypad injection.
+- Flash bundled CalSci firmware images directly from VS Code.
 
-## Behavior
+## Current support
 
-- Extension scans for strict `CalSci` USB devices.
-- Backend is the single serial reader and writer while a session is open.
-- Selecting a device opens and holds the port inside the extension session.
-- `Run Non-Interactive File` uses raw REPL on the existing session and returns to the friendly REPL without resetting on success.
-- `Run Interactive File` uses the normal REPL and MicroPython paste mode so `input()` and live terminal interaction work through the CalSci terminal.
-- If a non-interactive run leaves the session in a bad state, backend recovery first tries to restore the friendly REPL and only falls back to a soft reset as a last resort.
-- `Soft Reset Device` reuses the same held session.
-- `Open Hybrid Panel` reuses the same held session and talks to the current helper contract (`_hyb_mode`, `_hyb_poll_state`, `_hyb_sync_full`, `_hyb_key`) through the backend.
-- External terminals should not be able to claim the same port while the extension session is active.
+- Linux only for the `0.1.0` release.
+- Packaged releases currently target the Linux architecture they were built on, such as `linux-x64`.
+- Supports the current CalSci hardware model.
+
+## Requirements
+
+- Visual Studio Code `1.85.0` or newer.
+- Working USB/serial permissions on the Linux machine.
+- A CalSci device connected over USB.
+
+## Packaged extension runtime
+
+The packaged `.vsix` bundles its own Python runtime, Python dependencies, backend scripts, and firmware images. End users do not need to install `python3`, run `pip install`, or provide internet access on first run.
+
+## Building the packaged runtime
+
+When packaging a release from source, run:
+
+```bash
+npm run build
+```
+
+This stages a bundled runtime under `runtime/<platform>` and then compiles the extension. The runtime staging step looks for the CalSci builder environment created by the extension under VS Code global storage, or you can point it at a prepared source environment with `CALSCI_SOURCE_SITE_PACKAGES` or `CALSCI_SOURCE_PYENV`.
+
+## Getting started
+
+1. Install the extension.
+2. Connect your CalSci device over USB.
+3. Open the CalSci view container from the activity bar.
+4. Run `CalSci: Select Device`.
+5. Run `CalSci: Open Terminal` to open the persistent REPL.
+6. Use `CalSci: Run Non-Interactive File` or `CalSci: Run Interactive File` on the active Python file.
+
+## Main commands
+
+- `CalSci: Select Device`
+- `CalSci: Open Terminal`
+- `CalSci: Soft Reset Device`
+- `CalSci: Run Non-Interactive File`
+- `CalSci: Run Interactive File`
+- `CalSci: Open Hybrid Panel`
+- `CalSci: Flash Firmware`
+- `CalSci: Refresh Workspace`
+- `CalSci: Refresh Testing Folder`
+- `CalSci: Clear All Files`
 
 ## Settings
 
-- `calsci.resetTimeoutSeconds` default `5`
-- `calsci.runTimeoutSeconds` default `0` (`0` disables timeout)
+- `calsci.resetTimeoutSeconds`: timeout for waiting on the CalSci prompt after soft reset.
+- `calsci.runTimeoutSeconds`: timeout for non-interactive file execution. Set `0` to disable the timeout.
+- `calsci.autoConnectOnDetect`: automatically connect when the selected CalSci device is detected.
+- `calsci.autoScanWorkspace`: automatically scan the device workspace when the CalSci Workspace view opens.
 
-## Development
+## Firmware
 
-1. `npm install`
-2. `npm run compile`
-3. Press `F5` in VS Code
+`CalSci: Flash Firmware` uses firmware files bundled inside the extension package, so users do not need to download the image set separately before flashing.
+
+## Support
+
+- Website: https://calsci.io
+- Email: mailto:contact@calsci.io

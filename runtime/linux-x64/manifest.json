@@ -1,0 +1,8 @@
+{
+  "platformKey": "linux-x64",
+  "pythonVersion": "3.12.3",
+  "pythonExecutable": "bin/python3",
+  "sitePackages": "lib/python3.12/site-packages",
+  "libraryPath": "lib",
+  "sourceSitePackages": "/home/rupesh/.config/Code/User/globalStorage/calsci-io.calsci-vscode-extension/pyenv/lib/python3.12/site-packages"
+}

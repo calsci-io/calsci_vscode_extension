@@ -64,10 +64,10 @@ export class CalSciExtensionController implements vscode.Disposable {
 
   private replTerminal: vscode.Terminal | undefined;
   private replPty: CalSciReplPseudoterminal | undefined;
-  private replShown = false;
   private hybridPanel: CalSciHybridPanel | undefined;
   private hybridStatus: HybridStatus = { connected: false, active: false };
   private hybridState: HybridState = {};
+  private disposing = false;
 
   private lastSessionAttemptAt = 0;
   private lastSessionAttemptPort: string | undefined;
@@ -144,6 +144,9 @@ export class CalSciExtensionController implements vscode.Disposable {
           this.replPty.dispose();
           this.replPty = undefined;
         }
+        if (!this.disposing) {
+          void this.handleReplTerminalClosed();
+        }
       }),
     );
   }
@@ -190,6 +193,7 @@ export class CalSciExtensionController implements vscode.Disposable {
   }
 
   public dispose(): void {
+    this.disposing = true;
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
@@ -267,6 +271,7 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     await this.pollDevices();
     if (this.devices.length === 0) {
+      void vscode.window.showWarningMessage("No CalSci device detected. Connect the device, then run Select Device again.");
       return;
     }
 
@@ -1575,7 +1580,11 @@ export class CalSciExtensionController implements vscode.Disposable {
     await this.pollDevices();
 
     if (this.devices.length === 0) {
-      throw new Error("No device found.");
+      throw new Error("No device found. Connect CalSci, then use Select Device.");
+    }
+
+    if (!this.selectedPort) {
+      throw new Error("No device selected. Use CalSci: Select Device first.");
     }
 
     const selected = this.devices.find((device) => device.port === this.selectedPort);
@@ -1583,29 +1592,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       return selected.port;
     }
 
-    if (this.devices.length === 1) {
-      await this.persistSelectedPort(this.devices[0].port);
-      return this.devices[0].port;
-    }
-
-    const picks = this.devices.map((device) => ({
-      label: device.port,
-      detail: device.description || device.product,
-      port: device.port,
-    }));
-
-    const choice = await vscode.window.showQuickPick(picks, {
-      title: "Select Device",
-      placeHolder: "Choose device for this operation",
-      ignoreFocusOut: true,
-    });
-
-    if (!choice) {
-      throw new Error("Operation cancelled. No device selected.");
-    }
-
-    await this.persistSelectedPort(choice.port);
-    return choice.port;
+    const missingSelection = this.selectedPort;
+    await this.persistSelectedPort(undefined);
+    throw new Error(`Selected device ${missingSelection} is not available. Use CalSci: Select Device again.`);
   }
 
   private async pollDevices(options?: PollOptions): Promise<void> {
@@ -1637,7 +1626,10 @@ export class CalSciExtensionController implements vscode.Disposable {
         return;
       }
 
-      if (options?.forceSessionConnect || (allowSessionConnect && this.shouldAttemptSession(this.selectedPort))) {
+      await this.closeDetachedSessionIfIdle();
+
+      const shouldMaintainSession = this.shouldMaintainPersistentSession(Boolean(options?.showTerminalOnConnect));
+      if (options?.forceSessionConnect || (allowSessionConnect && shouldMaintainSession && this.shouldAttemptSession(this.selectedPort))) {
         await this.ensureSessionForSelection({
           force: Boolean(options?.forceSessionConnect),
           notifyOnError: false,
@@ -1661,10 +1653,6 @@ export class CalSciExtensionController implements vscode.Disposable {
         return;
       }
       await this.persistSelectedPort(undefined);
-    }
-
-    if (this.devices.length > 0) {
-      await this.persistSelectedPort(this.devices[0].port);
     }
   }
 
@@ -1711,8 +1699,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.sessionOpenInFlight = true;
     this.lastSessionAttemptAt = Date.now();
     this.lastSessionAttemptPort = this.selectedPort;
-    this.ensureReplTerminal();
-    if (options.showTerminal || !this.replShown) {
+    if (options.showTerminal) {
       this.showReplTerminal(true);
     }
     this.refreshStatus();
@@ -1784,6 +1771,20 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
     this.sessionState = { connected: false };
     this.refreshStatus();
+  }
+
+  private async closeDetachedSessionIfIdle(): Promise<void> {
+    if (!this.sessionState.connected || this.shouldMaintainPersistentSession()) {
+      return;
+    }
+    await this.closeSessionSilently();
+  }
+
+  private async handleReplTerminalClosed(): Promise<void> {
+    if (this.operationInFlight > 0 || this.runInFlight || this.sessionOpenInFlight || this.hybridStatus.active) {
+      return;
+    }
+    await this.closeDetachedSessionIfIdle();
   }
 
   private handleSessionStateChange(state: SessionState): void {
@@ -1872,7 +1873,10 @@ export class CalSciExtensionController implements vscode.Disposable {
   private showReplTerminal(preserveFocus: boolean): void {
     const terminal = this.ensureReplTerminal();
     terminal.show(preserveFocus);
-    this.replShown = true;
+  }
+
+  private shouldMaintainPersistentSession(showTerminalOnConnect = false): boolean {
+    return showTerminalOnConnect || Boolean(this.replTerminal) || this.hybridStatus.active;
   }
 
   private refreshStatus(): void {
@@ -1887,6 +1891,11 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
 
     if (!this.selectedPort) {
+      if (this.devices.length > 0) {
+        this.setNeedsSelectionStatus("Device detected. Run Select Device to enable communication.");
+        return;
+      }
+
       this.setNoDeviceStatus("No device selected.");
       return;
     }
@@ -1932,6 +1941,13 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.statusItem.color = new vscode.ThemeColor("terminal.ansiYellow");
     this.statusItem.tooltip = reason;
     this.setRunVisible(true);
+  }
+
+  private setNeedsSelectionStatus(reason: string): void {
+    this.statusItem.text = "$(plug) Select Device";
+    this.statusItem.color = new vscode.ThemeColor("terminal.ansiYellow");
+    this.statusItem.tooltip = reason;
+    this.setRunVisible(false);
   }
 
   private setNoDeviceStatus(reason: string): void {

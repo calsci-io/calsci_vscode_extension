@@ -30,15 +30,15 @@ import {
 } from "../core/shared";
 
 export class BackendServiceClient implements vscode.Disposable {
-  private readonly storagePath: string;
-  private readonly venvPath: string;
   private readonly backendScriptPath: string;
+  private readonly runtimeRootPath: string;
 
   private readonly terminalOutputEmitter = new vscode.EventEmitter<string>();
   private readonly sessionStateEmitter = new vscode.EventEmitter<SessionState>();
   private readonly hybridEventEmitter = new vscode.EventEmitter<BackendHybridEventPayload>();
 
-  private venvPythonPath: string | undefined;
+  private bundledPythonPath: string | undefined;
+  private bundledPythonEnv: NodeJS.ProcessEnv | undefined;
   private serviceProcess: ChildProcessWithoutNullStreams | undefined;
   private serviceReader: readline.Interface | undefined;
   private serviceStartPromise: Promise<void> | undefined;
@@ -52,28 +52,19 @@ export class BackendServiceClient implements vscode.Disposable {
   public readonly onHybridEvent = this.hybridEventEmitter.event;
 
   constructor(private readonly context: vscode.ExtensionContext) {
-    this.storagePath = context.globalStorageUri.fsPath;
-    this.venvPath = path.join(this.storagePath, "pyenv");
     this.backendScriptPath = path.join(context.extensionPath, "backend", "calsci_backend.py");
+    this.runtimeRootPath = path.join(context.extensionPath, "runtime");
   }
 
   public async ensureReady(): Promise<void> {
-    await fs.promises.mkdir(this.storagePath, { recursive: true });
+    const bundledRuntime = await this.resolveBundledRuntime();
+    this.bundledPythonPath = bundledRuntime.pythonPath;
+    this.bundledPythonEnv = bundledRuntime.env;
 
-    const systemPython = await this.resolveSystemPython();
-    const venvPython = this.getVenvPythonPath();
-    const hasVenvPython = await this.fileExists(venvPython);
-
-    if (!hasVenvPython) {
-      const created = await this.runProcess(systemPython[0], [...systemPython.slice(1), "-m", "venv", this.venvPath], 120000);
-      if (created.code !== 0) {
-        throw new Error(this.joinStdStreams(created, "Failed to create private Python environment."));
-      }
+    const check = await this.runBundledPython(["-c", "import serial, esptool"], 10000);
+    if (check.code !== 0) {
+      throw new Error(this.joinStdStreams(check, "Bundled CalSci runtime failed validation."));
     }
-
-    this.venvPythonPath = venvPython;
-    await this.ensurePyserialInstalled();
-    await this.ensureEsptoolInstalled();
     await this.startService();
   }
 
@@ -349,11 +340,11 @@ export class BackendServiceClient implements vscode.Disposable {
     if (this.serviceStartPromise) {
       return this.serviceStartPromise;
     }
-
-    const python = this.requireVenvPython();
+    const python = this.requireBundledPython();
+    const runtimeEnv = this.requireBundledPythonEnv();
 
     this.serviceStartPromise = new Promise<void>((resolve, reject) => {
-      const child = spawn(python, [this.backendScriptPath, "serve"], { shell: false });
+      const child = spawn(python, [this.backendScriptPath, "serve"], { shell: false, env: runtimeEnv });
       let ready = false;
 
       this.serviceProcess = child;
@@ -474,63 +465,130 @@ export class BackendServiceClient implements vscode.Disposable {
     }
   }
 
-  private requireVenvPython(): string {
-    if (!this.venvPythonPath) {
-      throw new Error("CalSci backend is not initialized.");
+  private requireBundledPython(): string {
+    if (!this.bundledPythonPath) {
+      throw new Error("CalSci bundled runtime is not initialized.");
     }
-    return this.venvPythonPath;
+    return this.bundledPythonPath;
   }
 
-  private async ensurePyserialInstalled(): Promise<void> {
-    await this.ensurePythonModuleInstalled("serial", "pyserial", "Failed to install pyserial in CalSci runtime.");
+  private requireBundledPythonEnv(): NodeJS.ProcessEnv {
+    if (!this.bundledPythonEnv) {
+      throw new Error("CalSci bundled runtime environment is not initialized.");
+    }
+    return this.bundledPythonEnv;
   }
 
-  private async ensureEsptoolInstalled(): Promise<void> {
-    await this.ensurePythonModuleInstalled("esptool", "esptool", "Failed to install esptool in CalSci runtime.");
+  private async runBundledPython(args: string[], timeoutMs: number): Promise<ProcessResult> {
+    return this.runProcess(this.requireBundledPython(), args, timeoutMs, this.requireBundledPythonEnv());
   }
 
-  private async ensurePythonModuleInstalled(moduleName: string, packageName: string, failureMessage: string): Promise<void> {
-    const python = this.requireVenvPython();
+  private async resolveBundledRuntime(): Promise<{ pythonPath: string; env: NodeJS.ProcessEnv }> {
+    const platformKey = this.getRuntimePlatformKey();
+    const runtimePath = path.join(this.runtimeRootPath, platformKey);
+    const manifestPath = path.join(runtimePath, "manifest.json");
 
-    const check = await this.runProcess(python, ["-c", `import ${moduleName}`], 10000);
-    if (check.code === 0) {
-      return;
+    const manifest = await this.loadRuntimeManifest(manifestPath, platformKey);
+    const pythonPath = path.join(runtimePath, manifest.pythonExecutable);
+    const sitePackagesPath = path.join(runtimePath, manifest.sitePackages);
+    const libraryPath = path.join(runtimePath, manifest.libraryPath);
+
+    if (!await this.fileExists(pythonPath)) {
+      throw new Error(`Bundled CalSci runtime executable not found: ${pythonPath}. Reinstall the extension package.`);
+    }
+    if (!await this.directoryExists(sitePackagesPath)) {
+      throw new Error(`Bundled CalSci site-packages not found: ${sitePackagesPath}. Reinstall the extension package.`);
+    }
+    if (!await this.directoryExists(libraryPath)) {
+      throw new Error(`Bundled CalSci runtime library path not found: ${libraryPath}. Reinstall the extension package.`);
     }
 
-    const install = await this.runProcess(
-      python,
-      ["-m", "pip", "install", "--disable-pip-version-check", packageName],
-      180000,
-    );
-    if (install.code !== 0) {
-      throw new Error(this.joinStdStreams(install, failureMessage));
+    return {
+      pythonPath,
+      env: this.createRuntimeEnv(runtimePath, sitePackagesPath, libraryPath),
+    };
+  }
+
+  private getRuntimePlatformKey(): string {
+    if (process.platform !== "linux") {
+      throw new Error(`CalSci bundled runtime is only available on Linux. Current platform: ${process.platform}.`);
+    }
+
+    switch (process.arch) {
+      case "x64":
+        return "linux-x64";
+      case "arm64":
+        return "linux-arm64";
+      default:
+        throw new Error(`CalSci bundled runtime is not available for Linux architecture: ${process.arch}.`);
     }
   }
 
-  private async resolveSystemPython(): Promise<string[]> {
-    const candidates = process.platform === "win32" ? [["py", "-3"], ["python"], ["python3"]] : [["python3"], ["python"]];
-
-    for (const candidate of candidates) {
-      const result = await this.runProcess(candidate[0], [...candidate.slice(1), "--version"], 10000);
-      if (result.code === 0) {
-        return candidate;
-      }
+  private async loadRuntimeManifest(
+    manifestPath: string,
+    platformKey: string,
+  ): Promise<{ pythonExecutable: string; sitePackages: string; libraryPath: string }> {
+    let rawManifest: string;
+    try {
+      rawManifest = await fs.promises.readFile(manifestPath, "utf8");
+    } catch {
+      throw new Error(`Bundled CalSci runtime manifest missing for ${platformKey}: ${manifestPath}. Reinstall the extension package.`);
     }
 
-    throw new Error("No usable system Python found.");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawManifest);
+    } catch {
+      throw new Error(`Bundled CalSci runtime manifest is invalid JSON: ${manifestPath}.`);
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error(`Bundled CalSci runtime manifest is malformed: ${manifestPath}.`);
+    }
+
+    const manifest = parsed as Partial<{ pythonExecutable: string; sitePackages: string; libraryPath: string }>;
+    if (!manifest.pythonExecutable || !manifest.sitePackages || !manifest.libraryPath) {
+      throw new Error(`Bundled CalSci runtime manifest is incomplete: ${manifestPath}.`);
+    }
+
+    return {
+      pythonExecutable: manifest.pythonExecutable,
+      sitePackages: manifest.sitePackages,
+      libraryPath: manifest.libraryPath,
+    };
   }
 
-  private getVenvPythonPath(): string {
-    if (process.platform === "win32") {
-      return path.join(this.venvPath, "Scripts", "python.exe");
+  private createRuntimeEnv(runtimePath: string, sitePackagesPath: string, libraryPath: string): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PYTHONHOME: runtimePath,
+      PYTHONPATH: sitePackagesPath,
+      PYTHONNOUSERSITE: "1",
+      PATH: [path.join(runtimePath, "bin"), process.env.PATH].filter((value): value is string => Boolean(value)).join(path.delimiter),
+    };
+
+    if (process.platform === "linux") {
+      env.LD_LIBRARY_PATH = [libraryPath, process.env.LD_LIBRARY_PATH]
+        .filter((value): value is string => Boolean(value))
+        .join(path.delimiter);
     }
-    return path.join(this.venvPath, "bin", "python");
+
+    return env;
   }
 
   private async fileExists(targetPath: string): Promise<boolean> {
     try {
       await fs.promises.access(targetPath, fs.constants.X_OK);
       return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async directoryExists(targetPath: string): Promise<boolean> {
+    try {
+      const stat = await fs.promises.stat(targetPath);
+      return stat.isDirectory();
     } catch {
       return false;
     }
@@ -560,9 +618,9 @@ export class BackendServiceClient implements vscode.Disposable {
     };
   }
 
-  private runProcess(command: string, args: string[], timeoutMs: number): Promise<ProcessResult> {
+  private runProcess(command: string, args: string[], timeoutMs: number, env?: NodeJS.ProcessEnv): Promise<ProcessResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn(command, args, { shell: false });
+      const child = spawn(command, args, { shell: false, env });
       let stdout = "";
       let stderr = "";
       let timedOut = false;

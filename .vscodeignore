@@ -1,4 +1,16 @@
 src/**
+scripts/**
 tsconfig.json
 *.ts
 **/.gitignore
+runtime/.tmp/**
+!out/**
+!backend/**
+!firmware/**
+!runtime/**
+!media/**
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!SUPPORT.md
