@@ -8,6 +8,7 @@ import {
   BACKEND_TIMEOUT_BUFFER_SEC,
   type BackendHybridEventPayload,
   type BackendMessage,
+  type ChipEraseResult,
   type ClearAllFilesResult,
   type FirmwareFlashPaths,
   type FirmwareFlashResult,
@@ -283,6 +284,26 @@ export class BackendServiceClient implements vscode.Disposable {
         calOsPath: paths.calOsPath,
         partitionTablePath: paths.partitionTablePath,
         otaDataPath: paths.otaDataPath,
+        manualBootloader: Boolean(options?.manualBootloader),
+      },
+      {
+        stream: true,
+        onStream: onOutputLine,
+      },
+    );
+  }
+
+  public async eraseChip(
+    port: string,
+    onOutputLine: (line: string, isError: boolean) => void,
+    options?: {
+      manualBootloader?: boolean;
+    },
+  ): Promise<ChipEraseResult> {
+    return this.request<ChipEraseResult>(
+      "chip.erase",
+      {
+        port,
         manualBootloader: Boolean(options?.manualBootloader),
       },
       {

@@ -120,6 +120,12 @@ export type FirmwareFlashResult = {
   error?: string;
 };
 
+export type ChipEraseResult = {
+  ok: boolean;
+  port: string;
+  error?: string;
+};
+
 export type RunCancelResult = {
   ok: boolean;
   active?: boolean;

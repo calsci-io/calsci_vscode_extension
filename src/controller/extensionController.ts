@@ -3,6 +3,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import {
+  type ChipEraseResult,
   type ClearAllFilesResult,
   MAX_SYNC_FOLDER_HISTORY,
   POLL_INTERVAL_MS,
@@ -46,6 +47,7 @@ export class CalSciExtensionController implements vscode.Disposable {
   private readonly syncOutput: vscode.OutputChannel;
   private readonly cleanupOutput: vscode.OutputChannel;
   private readonly firmwareOutput: vscode.OutputChannel;
+  private readonly chipEraseOutput: vscode.OutputChannel;
   private readonly workspaceOutput: vscode.OutputChannel;
   private readonly workspaceViewProvider: CalSciWorkspaceViewProvider;
   private readonly testingFolderViewProvider: CalSciTestingFolderViewProvider;
@@ -97,6 +99,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.syncOutput = vscode.window.createOutputChannel("CalSci Folder Sync");
     this.cleanupOutput = vscode.window.createOutputChannel("CalSci Clear All Files");
     this.firmwareOutput = vscode.window.createOutputChannel("CalSci Firmware Upload");
+    this.chipEraseOutput = vscode.window.createOutputChannel("CalSci Chip Erase");
     this.workspaceOutput = vscode.window.createOutputChannel("CalSci Workspace");
     this.workspaceContentProvider = new CalSciWorkspaceContentProvider();
     this.workspaceViewProvider = new CalSciWorkspaceViewProvider({
@@ -160,6 +163,7 @@ export class CalSciExtensionController implements vscode.Disposable {
       this.syncOutput,
       this.cleanupOutput,
       this.firmwareOutput,
+      this.chipEraseOutput,
       this.workspaceOutput,
     );
     this.registerCommands();
@@ -220,6 +224,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.syncOutput.dispose();
     this.cleanupOutput.dispose();
     this.firmwareOutput.dispose();
+    this.chipEraseOutput.dispose();
     this.workspaceOutput.dispose();
   }
 
@@ -236,6 +241,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand("calsci.flashFirmware", async () => {
         await this.uploadFirmwareFromPanel();
+      }),
+      vscode.commands.registerCommand("calsci.eraseChip", async () => {
+        await this.eraseChipFromPanel();
       }),
       vscode.commands.registerCommand("calsci.runCurrentFile", async () => {
         await this.runCurrentFile();
@@ -310,8 +318,11 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
     if (this.operationInFlight > 0) {
-      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
-      return;
+      const settled = await this.waitForOperationToSettle(2000);
+      if (!settled) {
+        void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+        return;
+      }
     }
 
     let port: string;
@@ -403,8 +414,11 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
     if (this.operationInFlight > 0) {
-      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
-      return;
+      const settled = await this.waitForOperationToSettle(2000);
+      if (!settled) {
+        void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+        return;
+      }
     }
 
     this.runInFlight = true;
@@ -878,8 +892,11 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
     if (this.operationInFlight > 0) {
-      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
-      return;
+      const settled = await this.waitForOperationToSettle(2000);
+      if (!settled) {
+        void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+        return;
+      }
     }
 
     const remoteFile = remotePath?.trim();
@@ -1140,6 +1157,14 @@ export class CalSciExtensionController implements vscode.Disposable {
 
   private shouldAutoScanWorkspace(): boolean {
     return vscode.workspace.getConfiguration("calsci").get<boolean>("autoScanWorkspace", false);
+  }
+
+  private async waitForOperationToSettle(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (this.operationInFlight > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return this.operationInFlight === 0;
   }
 
   private async stopHybridForExclusiveOperation(): Promise<boolean> {
@@ -1403,7 +1428,7 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
 
-    if (!result.ok && this.isLikelyFirmwareConnectError(result.error)) {
+    if (!result.ok && this.isLikelyEsptoolConnectError(result.error)) {
       const retry = await vscode.window.showWarningMessage(
         `Automatic firmware flashing could not connect to ${result.port || preferredPort || "the detected device"}. Put CalSci into bootloader mode manually, then retry.`,
         {
@@ -1445,6 +1470,93 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     const detail = result.error ? ` ${result.error}` : "";
     void vscode.window.showErrorMessage(`Firmware flash failed on ${result.port || preferredPort || "the detected device"}.${detail}`);
+  }
+
+  private async eraseChipFromPanel(): Promise<void> {
+    if (!this.backendReady) {
+      void vscode.window.showErrorMessage("CalSci backend is still initializing.");
+      return;
+    }
+    if (this.runInFlight) {
+      void vscode.window.showWarningMessage("CalSci is busy with a run operation.");
+      return;
+    }
+    if (this.operationInFlight > 0) {
+      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+      return;
+    }
+
+    const preferredPort = this.selectedPort?.trim() ?? "";
+
+    const confirm = await vscode.window.showWarningMessage(
+      "Erase the entire flash on the detected ESP device? This removes CalSci firmware and all stored data.",
+      {
+        modal: true,
+        detail: preferredPort
+          ? `The extension will auto-detect the current ESP port and prefer the selected port ${preferredPort} when it is available. You will need to flash firmware again before CalSci can reconnect.`
+          : "The extension will auto-detect the current ESP port, erase the entire chip flash, and leave the device without firmware until you flash it again.",
+      },
+      "Erase Chip",
+    );
+    if (confirm !== "Erase Chip") {
+      return;
+    }
+
+    let result: ChipEraseResult;
+    try {
+      result = await this.runChipEraseAttempt({
+        port: preferredPort,
+        manualBootloader: false,
+        progressTitle: "CalSci: Erasing detected ESP chip",
+        clearOutput: true,
+      });
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Chip erase failed."));
+      return;
+    }
+
+    if (!result.ok && this.isLikelyEsptoolConnectError(result.error)) {
+      const retry = await vscode.window.showWarningMessage(
+        `Automatic chip erase could not connect to ${result.port || preferredPort || "the detected device"}. Put CalSci into bootloader mode manually, then retry.`,
+        {
+          modal: true,
+          detail: "Hold BOOT, tap RESET, then release BOOT. The extension will auto-detect the current ESP port and retry after bootloader confirmation.",
+        },
+        "Retry Erase",
+      );
+
+      if (retry === "Retry Erase") {
+        try {
+          result = await this.runChipEraseAttempt({
+            port: result.port || preferredPort,
+            manualBootloader: true,
+            progressTitle: "CalSci: Waiting for bootloader mode on detected ESP device",
+            clearOutput: false,
+          });
+        } catch (error) {
+          void vscode.window.showErrorMessage(this.errorMessage(error, "Manual bootloader chip erase failed."));
+          return;
+        }
+      }
+    }
+
+    this.chipEraseOutput.show(false);
+    await this.persistSelectedPort(result.port || preferredPort || undefined);
+    await this.pollDevices({ allowSessionConnect: false });
+    if (result.ok) {
+      const erasedPort = result.port || preferredPort || "the detected device";
+      if (preferredPort && erasedPort !== preferredPort) {
+        void vscode.window.showInformationMessage(
+          `Chip erase complete. Device port changed to ${erasedPort}. Flash firmware before reconnecting.`,
+        );
+      } else {
+        void vscode.window.showInformationMessage(`Chip erase complete on ${erasedPort}. Flash firmware before reconnecting.`);
+      }
+      return;
+    }
+
+    const detail = result.error ? ` ${result.error}` : "";
+    void vscode.window.showErrorMessage(`Chip erase failed on ${result.port || preferredPort || "the detected device"}.${detail}`);
   }
 
   private async runFirmwareFlashAttempt(options: {
@@ -1498,6 +1610,51 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
   }
 
+  private async runChipEraseAttempt(options: {
+    port: string;
+    manualBootloader: boolean;
+    progressTitle: string;
+    clearOutput: boolean;
+  }): Promise<ChipEraseResult> {
+    const { port, manualBootloader, progressTitle, clearOutput } = options;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      return await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: progressTitle,
+          cancellable: false,
+        },
+        async (progress) => {
+          if (clearOutput) {
+            this.chipEraseOutput.clear();
+          } else {
+            this.chipEraseOutput.appendLine("");
+            this.chipEraseOutput.appendLine("----");
+          }
+          this.chipEraseOutput.appendLine(`CalSci chip erase target: ${port || "auto-detect ESP port"}`);
+          this.chipEraseOutput.appendLine(`Mode: ${manualBootloader ? "manual bootloader retry" : "automatic USB reset"}`);
+          this.chipEraseOutput.appendLine("");
+          this.chipEraseOutput.show(false);
+
+          return this.backend.eraseChip(
+            port,
+            (line: string, isError: boolean) => {
+              const formatted = isError ? `[ERROR] ${line}` : line;
+              this.chipEraseOutput.appendLine(formatted);
+              progress.report({ message: formatted.slice(0, 100) });
+            },
+            { manualBootloader },
+          );
+        },
+      );
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+    }
+  }
+
   private async resolveFirmwareFlashPaths(): Promise<FirmwareFlashPaths> {
     const firmwareRoot = path.join(this.context.extensionPath, "firmware", "esp32s3", "latest");
     const firmwarePaths: FirmwareFlashPaths = {
@@ -1523,7 +1680,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     return firmwarePaths;
   }
 
-  private isLikelyFirmwareConnectError(errorText: string | undefined): boolean {
+  private isLikelyEsptoolConnectError(errorText: string | undefined): boolean {
     if (!errorText) {
       return false;
     }
@@ -1824,13 +1981,13 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.hybridPanel?.updateSessionState(this.sessionState);
     this.hybridPanel?.updateHybridStatus(this.hybridStatus);
     const portChanged = Boolean(previousPort && this.sessionState.port && previousPort !== this.sessionState.port);
-    const disconnected = previousConnected && !this.sessionState.connected;
     if (!this.sessionState.connected || (this.pendingHybridRestorePort && this.sessionState.port !== this.pendingHybridRestorePort)) {
       this.pendingHybridRestorePort = undefined;
       this.hybridRestoreInFlight = false;
       this.recentTerminalOutput = "";
     }
-    if (portChanged || disconnected) {
+    const selectionCleared = !this.selectedPort;
+    if (portChanged || selectionCleared) {
       this.workspaceContentProvider.clear();
       this.workspaceViewProvider.invalidate();
     }

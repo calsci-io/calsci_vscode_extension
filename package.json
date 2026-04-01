@@ -44,6 +44,7 @@
     "onCommand:calsci.syncFolder",
     "onCommand:calsci.clearAllFiles",
     "onCommand:calsci.flashFirmware",
+    "onCommand:calsci.eraseChip",
     "onCommand:calsci.refreshWorkspace",
     "onCommand:calsci.refreshTestingFolder",
     "onCommand:calsci.openHybridPanel"
@@ -149,6 +150,14 @@
         "title": "CalSci: Flash Firmware"
       },
       {
+        "command": "calsci.eraseChip",
+        "title": "CalSci: Erase Chip",
+        "icon": {
+          "light": "media/erase.svg",
+          "dark": "media/erase.svg"
+        }
+      },
+      {
         "command": "calsci.refreshWorkspace",
         "title": "CalSci: Refresh Workspace",
         "icon": {
@@ -183,19 +192,24 @@
           "group": "navigation@3"
         },
         {
-          "command": "calsci.runCurrentFile",
+          "command": "calsci.eraseChip",
           "when": "view == calsci.actionsView",
           "group": "navigation@4"
         },
         {
-          "command": "calsci.runInteractiveFile",
+          "command": "calsci.runCurrentFile",
           "when": "view == calsci.actionsView",
           "group": "navigation@5"
         },
         {
-          "command": "calsci.openTerminal",
+          "command": "calsci.runInteractiveFile",
           "when": "view == calsci.actionsView",
           "group": "navigation@6"
+        },
+        {
+          "command": "calsci.openTerminal",
+          "when": "view == calsci.actionsView",
+          "group": "navigation@7"
         },
         {
           "command": "calsci.refreshWorkspace",

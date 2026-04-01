@@ -131,6 +131,7 @@ COMMAND_PRIORITY = {
     "workspace.import": 11,
     "hybrid.start": 11,
     "hybrid.stop": 12,
+    "chip.erase": 15,
     "firmware.flash": 15,
     "soft-reset": 20,
     "session.close": 25,
@@ -3324,6 +3325,17 @@ class JobDispatcher:
                         )
                     ) if job.stream else None,
                 )
+            if job.command == "chip.erase":
+                self._session.close(reason="chip-erase")
+                return erase_chip(
+                    port=_optional_arg_string(args, "port") or "",
+                    manual_bootloader=bool(args.get("manualBootloader", False)),
+                    progress_callback=(
+                        lambda line, req_id=job.request_id: _service_emit(
+                            {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
+                        )
+                    ) if job.stream else None,
+                )
             if job.command == "firmware.flash":
                 self._session.close(reason="firmware-flash")
                 return flash_firmware_bundle(
@@ -3509,6 +3521,51 @@ def _build_esptool_boot_cmd(
     ]
 
 
+def _build_esptool_erase_cmd(
+    port: str,
+    baudrate: int,
+    before: str,
+    after: str,
+    chip: str = FIRMWARE_FLASH_CHIP,
+    connect_attempts: int = FIRMWARE_FLASH_CONNECT_ATTEMPTS,
+) -> list[str]:
+    if importlib.util.find_spec("esptool") is not None:
+        return [
+            sys.executable,
+            "-m",
+            "esptool",
+            "--chip",
+            chip,
+            "--port",
+            port,
+            "--baud",
+            str(baudrate),
+            "--connect-attempts",
+            str(connect_attempts),
+            "--before",
+            before,
+            "--after",
+            after,
+            "erase-flash",
+        ]
+    return [
+        "esptool",
+        "--chip",
+        chip,
+        "--port",
+        port,
+        "--baud",
+        str(baudrate),
+        "--connect-attempts",
+        str(connect_attempts),
+        "--before",
+        before,
+        "--after",
+        after,
+        "erase-flash",
+    ]
+
+
 def _run_esptool(cmd: list[str], progress_callback: Callable[[str], None] | None = None) -> None:
     if progress_callback is not None:
         progress_callback(f"Running: {' '.join(cmd)}")
@@ -3624,7 +3681,7 @@ def _detect_initial_flash_port(
             progress_callback(f"Using detected ESP port {ports[0]}")
         return ports[0]
 
-    raise ControllerError("No ESP device detected for firmware flashing.")
+    raise ControllerError("No ESP device detected for erase or flash operations.")
 
 
 def _run_esptool_with_connect_retries(
@@ -3667,6 +3724,47 @@ def _run_esptool_with_connect_retries(
 
     if last_error is None:
         raise ControllerError("firmware-upload: unknown esptool failure")
+    raise last_error
+
+
+def _run_esptool_erase_with_connect_retries(
+    port: str,
+    progress_callback: Callable[[str], None] | None = None,
+    before_modes: tuple[str, ...] | None = None,
+    after_mode: str = FIRMWARE_FLASH_AFTER,
+) -> str:
+    if before_modes is None:
+        ordered_modes: list[str] = []
+        for mode in ("default-reset", FIRMWARE_FLASH_BEFORE, "usb-reset"):
+            if mode and mode not in ordered_modes:
+                ordered_modes.append(mode)
+        before_modes = tuple(ordered_modes)
+    last_error: Exception | None = None
+    attempt = 0
+
+    for before_mode in before_modes:
+        for baud in _retry_baud_candidates(FIRMWARE_FLASH_BAUDRATE):
+            attempt += 1
+            if attempt > 1 and progress_callback is not None:
+                progress_callback(f"Retry with --before {before_mode}, --baud {baud}")
+            try:
+                cmd = _build_esptool_erase_cmd(
+                    port=port,
+                    baudrate=baud,
+                    before=before_mode,
+                    after=after_mode,
+                )
+                _run_esptool(cmd, progress_callback=progress_callback)
+                return _wait_for_esp_port(port, progress_callback=progress_callback)
+            except Exception as exc:
+                last_error = exc
+                if not _is_esptool_connect_error(str(exc)):
+                    raise
+                time.sleep(0.5)
+                port = _wait_for_esp_port(port, progress_callback=progress_callback)
+
+    if last_error is None:
+        raise ControllerError("chip-erase: unknown esptool failure")
     raise last_error
 
 
@@ -3793,6 +3891,44 @@ def flash_firmware_bundle(
             "calOsPath": str(images["calos"]),
             "partitionTablePath": str(images["partition table"]),
             "otaDataPath": str(images["ota data"]),
+            "error": str(exc),
+        }
+
+
+def erase_chip(
+    port: str,
+    manual_bootloader: bool = False,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    requested_port = str(port or "").strip()
+    erase_port = requested_port
+
+    try:
+        erase_port = _detect_initial_flash_port(requested_port, progress_callback=progress_callback)
+        if manual_bootloader:
+            if progress_callback is not None:
+                progress_callback("Manual bootloader mode requested.")
+            erase_port = _confirm_manual_bootloader(erase_port, progress_callback=progress_callback)
+        elif progress_callback is not None:
+            progress_callback("Using automatic USB reset mode.")
+
+        if progress_callback is not None:
+            progress_callback("Erasing chip flash...")
+        erased_port = _run_esptool_erase_with_connect_retries(
+            erase_port,
+            progress_callback=progress_callback,
+            before_modes=("no-reset",) if manual_bootloader else None,
+        )
+        if progress_callback is not None:
+            progress_callback(f"Chip erase complete on {erased_port}")
+        return {
+            "ok": True,
+            "port": erased_port,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "port": erase_port or requested_port,
             "error": str(exc),
         }
 

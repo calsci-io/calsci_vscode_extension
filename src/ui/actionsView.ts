@@ -53,6 +53,13 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
     icon: "arrow-up",
   },
   {
+    id: "eraseChip",
+    label: "Erase Chip",
+    description: "Erase the entire ESP32-S3 flash. Reflash firmware before reconnecting.",
+    command: "calsci.eraseChip",
+    icon: "trash",
+  },
+  {
     id: "runCurrentFile",
     label: "Run Non-Interactive",
     description: "Run the active Python file through raw REPL.",
