@@ -9,7 +9,7 @@ CalSci turns Visual Studio Code into a desktop control surface for the CalSci de
 - Run the active Python file non-interactively over raw REPL without permanently uploading it to the device.
 - Run the active Python file interactively through the normal REPL so `input()` and live terminal interaction work as expected.
 - Scan for the connected CalSci device and keep a single extension-owned serial session active.
-- Sync a local folder to the device workspace.
+- Sync the contents of a local folder to the device workspace root.
 - Browse and open files from the device workspace view.
 - Clear all user files from the device workspace.
 - Use the hybrid panel for helper-path display mirroring and keypad injection.

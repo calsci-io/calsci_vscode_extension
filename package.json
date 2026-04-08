@@ -127,7 +127,7 @@
       },
       {
         "command": "calsci.syncFolder",
-        "title": "CalSci: Select Folder"
+        "title": "CalSci: Sync Folder"
       },
       {
         "command": "calsci.refreshTestingFolder",

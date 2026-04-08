@@ -83,7 +83,7 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
   {
     id: "syncFolder",
     label: "Select Folder",
-    description: "Choose a remembered folder or browse for one to sync.",
+    description: "Choose a folder and sync its contents to CalSci root.",
     command: "calsci.syncFolder",
     icon: "sync",
   },

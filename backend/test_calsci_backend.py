@@ -1129,5 +1129,199 @@ class SyncFolderTests(unittest.TestCase):
             self.assertIn('f = open("apps/main.py", "wb")', dummy.exec_calls[0])
 
 
+class FirmwareBootloaderTests(unittest.TestCase):
+    def test_request_bootloader_sends_machine_bootloader_command(self) -> None:
+        class Dummy:
+            def __init__(self) -> None:
+                self._in_raw_repl = False
+                self.enter_calls = 0
+                self.exec_calls: list[str] = []
+
+            def _drain_serial_input(self) -> None:
+                pass
+
+            def _enter_raw_repl(self, timeout_overall: float = 0.0) -> None:
+                self.enter_calls += 1
+                self._in_raw_repl = True
+
+            def _exec_raw_no_follow(self, code: str) -> None:
+                self.exec_calls.append(code)
+
+        dummy = Dummy()
+        backend.CalSciController.request_bootloader(dummy)
+
+        self.assertEqual(dummy.enter_calls, 1)
+        self.assertEqual(dummy.exec_calls, ["import machine\r\nmachine.bootloader()\r\n"])
+        self.assertFalse(dummy._in_raw_repl)
+
+    def test_persistent_session_request_bootloader_uses_active_session(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.port = "COM_TEST"
+                self.calls = 0
+
+            def request_bootloader(self) -> None:
+                self.calls += 1
+
+        progress_lines: list[str] = []
+        session = backend.PersistentSession(lambda _text: None, lambda _state: None, lambda _event: None)
+        controller = FakeController()
+        session._controller = controller  # type: ignore[assignment]
+        session._port = "COM_TEST"
+        session._begin_exclusive_operation = lambda: (controller, False)  # type: ignore[method-assign]
+        session._end_exclusive_operation = lambda _paused: None  # type: ignore[method-assign]
+
+        result = session.request_bootloader(port="COM_TEST", progress_callback=progress_lines.append)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["prepared"])
+        self.assertEqual(result["port"], "COM_TEST")
+        self.assertEqual(controller.calls, 1)
+        self.assertEqual(progress_lines, ["Requesting bootloader mode via active CalSci session on COM_TEST..."])
+
+    def test_persistent_session_request_bootloader_skips_mismatched_port(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.port = "COM_OPEN"
+                self.calls = 0
+
+            def request_bootloader(self) -> None:
+                self.calls += 1
+
+        session = backend.PersistentSession(lambda _text: None, lambda _state: None, lambda _event: None)
+        controller = FakeController()
+        session._controller = controller  # type: ignore[assignment]
+        session._port = "COM_OPEN"
+
+        result = session.request_bootloader(port="COM_OTHER")
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["prepared"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["sessionPort"], "COM_OPEN")
+        self.assertEqual(controller.calls, 0)
+
+    def test_wait_for_bootloader_ready_accepts_same_port_without_reset_signal(self) -> None:
+        original_scan = backend._scan_esp_ports
+        original_build = backend._build_esptool_boot_cmd
+        original_run = backend._run_esptool
+        original_wait = backend._wait_for_esp_port
+
+        seen_cmds: list[list[str]] = []
+
+        def fake_build(
+            port: str,
+            baudrate: int = backend.FIRMWARE_FLASH_BAUDRATE,
+            before: str = "no-reset",
+            after: str = "no-reset",
+            chip: str = backend.FIRMWARE_FLASH_CHIP,
+            connect_attempts: int = backend.FIRMWARE_FLASH_CONNECT_ATTEMPTS,
+        ) -> list[str]:
+            return [port, str(baudrate), before, after, chip, str(connect_attempts)]
+
+        try:
+            backend._scan_esp_ports = lambda: ["COM_TEST"]  # type: ignore[assignment]
+            backend._build_esptool_boot_cmd = fake_build  # type: ignore[assignment]
+            backend._run_esptool = lambda cmd, progress_callback=None: seen_cmds.append(cmd)  # type: ignore[assignment]
+            backend._wait_for_esp_port = lambda preferred, progress_callback=None: preferred  # type: ignore[assignment]
+
+            confirmed_port = backend._wait_for_bootloader_ready(
+                "COM_TEST",
+                timeout_seconds=0.2,
+                require_port_reset=False,
+            )
+        finally:
+            backend._scan_esp_ports = original_scan  # type: ignore[assignment]
+            backend._build_esptool_boot_cmd = original_build  # type: ignore[assignment]
+            backend._run_esptool = original_run  # type: ignore[assignment]
+            backend._wait_for_esp_port = original_wait  # type: ignore[assignment]
+
+        self.assertEqual(confirmed_port, "COM_TEST")
+        self.assertEqual(len(seen_cmds), 1)
+        self.assertEqual(seen_cmds[0][0], "COM_TEST")
+        self.assertEqual(seen_cmds[0][2:4], ["no-reset", "no-reset"])
+
+    def test_flash_firmware_bundle_uses_no_reset_when_bootloader_ready(self) -> None:
+        original_detect = backend._detect_initial_flash_port
+        original_run = backend._run_esptool_with_connect_retries
+
+        observed: dict[str, object] = {}
+
+        def fake_run(
+            image_pairs: list[tuple[str, pathlib.Path]],
+            port: str,
+            progress_callback=None,
+            before_modes: tuple[str, ...] | None = None,
+            after_mode: str = backend.FIRMWARE_FLASH_AFTER,
+        ) -> str:
+            observed["port"] = port
+            observed["before_modes"] = before_modes
+            observed["image_pairs"] = image_pairs
+            observed["after_mode"] = after_mode
+            return port
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            bootloader = root / "bootloader.bin"
+            partition = root / "partition-table.bin"
+            ota = root / "ota.bin"
+            calos = root / "micropython.bin"
+            for path in (bootloader, partition, ota, calos):
+                path.write_bytes(b"ok")
+
+            try:
+                backend._detect_initial_flash_port = lambda preferred, progress_callback=None: "COM_TEST"  # type: ignore[assignment]
+                backend._run_esptool_with_connect_retries = fake_run  # type: ignore[assignment]
+
+                result = backend.flash_firmware_bundle(
+                    port="COM_TEST",
+                    bootloader_path=str(bootloader),
+                    calos_path=str(calos),
+                    partition_table_path=str(partition),
+                    ota_data_path=str(ota),
+                    bootloader_ready=True,
+                )
+            finally:
+                backend._detect_initial_flash_port = original_detect  # type: ignore[assignment]
+                backend._run_esptool_with_connect_retries = original_run  # type: ignore[assignment]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(observed["port"], "COM_TEST")
+        self.assertEqual(observed["before_modes"], ("no-reset",))
+
+    def test_erase_chip_uses_no_reset_when_bootloader_ready(self) -> None:
+        original_detect = backend._detect_initial_flash_port
+        original_run = backend._run_esptool_erase_with_connect_retries
+
+        observed: dict[str, object] = {}
+
+        def fake_run(
+            port: str,
+            progress_callback=None,
+            before_modes: tuple[str, ...] | None = None,
+            after_mode: str = backend.FIRMWARE_FLASH_AFTER,
+        ) -> str:
+            observed["port"] = port
+            observed["before_modes"] = before_modes
+            observed["after_mode"] = after_mode
+            return port
+
+        try:
+            backend._detect_initial_flash_port = lambda preferred, progress_callback=None: "COM_TEST"  # type: ignore[assignment]
+            backend._run_esptool_erase_with_connect_retries = fake_run  # type: ignore[assignment]
+
+            result = backend.erase_chip(
+                port="COM_TEST",
+                bootloader_ready=True,
+            )
+        finally:
+            backend._detect_initial_flash_port = original_detect  # type: ignore[assignment]
+            backend._run_esptool_erase_with_connect_retries = original_run  # type: ignore[assignment]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(observed["port"], "COM_TEST")
+        self.assertEqual(observed["before_modes"], ("no-reset",))
+
+
 if __name__ == "__main__":
     unittest.main()

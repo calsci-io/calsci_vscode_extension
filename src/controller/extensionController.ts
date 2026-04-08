@@ -292,7 +292,7 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     const picks = this.devices.map((device) => ({
       label: device.port,
-      detail: device.description || device.product,
+      detail: this.formatDevicePickerDetail(device),
       port: device.port,
     }));
 
@@ -310,6 +310,34 @@ export class CalSciExtensionController implements vscode.Disposable {
     await this.ensureSessionForPort(choice.port, { force: true, notifyOnError: true, showTerminal: true });
     await this.pollDevices();
     void vscode.window.showInformationMessage(`Device selected: ${choice.port}`);
+  }
+
+  private formatDevicePickerDetail(device: DeviceInfo): string {
+    const normalizedProduct = this.normalizeCalSciUsbName(device.product);
+    if (normalizedProduct) {
+      return normalizedProduct;
+    }
+
+    const normalizedDescription = this.normalizeCalSciUsbName(device.description);
+    if (normalizedDescription) {
+      return normalizedDescription;
+    }
+
+    return device.product || device.description;
+  }
+
+  private normalizeCalSciUsbName(value: string): string {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return "";
+    }
+
+    const match = /^CalSci[_ -]([0-9a-fA-F]{12})$/.exec(trimmed);
+    if (!match) {
+      return "";
+    }
+
+    return `CalSci - ${match[1].toUpperCase()}`;
   }
 
   private async softResetDevice(): Promise<void> {
@@ -402,6 +430,94 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     const detail = result.error ? ` ${result.error}` : "";
     void vscode.window.showErrorMessage(`Soft reset failed on ${port}.${detail}`);
+  }
+
+  private async restorePromptAfterFirmwareFlash(port: string): Promise<SoftResetResult | undefined> {
+    this.firmwareOutput.appendLine("");
+    this.firmwareOutput.appendLine("Post-flash serial reset: requesting CalSci prompt...");
+    this.firmwareOutput.show(false);
+
+    await this.pollDevices();
+
+    let connected = await this.ensureSessionForPort(port, {
+      force: true,
+      notifyOnError: false,
+      showTerminal: true,
+    });
+    if (!connected) {
+      connected = await this.restartBackendAndReconnect(port);
+    }
+    if (!connected) {
+      this.firmwareOutput.appendLine(`Post-flash serial reset skipped: could not reopen session on ${port}.`);
+      return undefined;
+    }
+
+    const timeout = vscode.workspace.getConfiguration("calsci").get<number>("resetTimeoutSeconds", 5);
+
+    let result: SoftResetResult;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      result = await this.backend.softReset(port, timeout);
+    } catch (error) {
+      const message = this.errorMessage(error, "Post-flash serial reset failed.");
+      this.firmwareOutput.appendLine(message);
+      return {
+        ok: false,
+        promptSeen: false,
+        rebootSeen: false,
+        port,
+        output: "",
+        error: message,
+      };
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+      await this.pollDevices();
+    }
+
+    if (!result.ok) {
+      const recovered = await this.restartBackendAndReconnect(port);
+      if (recovered) {
+        try {
+          this.operationInFlight += 1;
+          this.refreshStatus();
+          result = await this.backend.softReset(port, timeout);
+        } catch (error) {
+          const message = this.errorMessage(error, "Post-flash serial reset recovery retry failed.");
+          this.firmwareOutput.appendLine(message);
+          return {
+            ok: false,
+            promptSeen: false,
+            rebootSeen: false,
+            port,
+            output: "",
+            error: message,
+          };
+        } finally {
+          this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+          this.refreshStatus();
+          await this.pollDevices();
+        }
+      }
+    }
+
+    if (result.ok) {
+      if (result.promptSeen) {
+        this.firmwareOutput.appendLine(`Post-flash serial reset complete on ${port}. CalSci prompt verified.`);
+      } else if (result.rebootSeen) {
+        this.firmwareOutput.appendLine(
+          `Post-flash serial reset reached a reboot on ${port}, but the CalSci prompt was not yet verified.`,
+        );
+      } else {
+        this.firmwareOutput.appendLine(`Post-flash serial reset complete on ${port}.`);
+      }
+    } else {
+      const detail = result.error ? ` ${result.error}` : "";
+      this.firmwareOutput.appendLine(`Post-flash serial reset failed on ${port}.${detail}`);
+    }
+
+    return result;
   }
 
   private async runCurrentFile(): Promise<void> {
@@ -1075,48 +1191,11 @@ export class CalSciExtensionController implements vscode.Disposable {
 
   private async buildSyncFolderSelection(folderPath: string): Promise<SyncFolderSelection> {
     const localFolder = path.resolve(folderPath);
-    const workspaceTarget = this.computeWorkspaceRemoteFolderTarget(localFolder);
-    if (workspaceTarget) {
-      return {
-        localFolder,
-        remoteFolder: workspaceTarget,
-        deleteExtraneous: true,
-      };
-    }
-
-    const directToRoot = await this.hasDeviceRootEntrypoint(localFolder);
     return {
       localFolder,
-      remoteFolder: directToRoot ? "/" : `/${path.basename(localFolder)}`,
+      remoteFolder: "/",
       deleteExtraneous: true,
     };
-  }
-
-  private computeWorkspaceRemoteFolderTarget(localFolder: string): string | undefined {
-    const resolvedFolder = path.resolve(localFolder);
-    for (const workspaceFolder of vscode.workspace.workspaceFolders ?? []) {
-      if (workspaceFolder.uri.scheme !== "file") {
-        continue;
-      }
-      const workspacePath = path.resolve(workspaceFolder.uri.fsPath);
-      const relative = path.relative(workspacePath, resolvedFolder);
-      if (relative === "") {
-        return "/";
-      }
-      if (!relative.startsWith("..") && !path.isAbsolute(relative)) {
-        return `/${relative.split(path.sep).join("/")}`;
-      }
-    }
-    return undefined;
-  }
-
-  private async hasDeviceRootEntrypoint(localFolder: string): Promise<boolean> {
-    for (const entrypoint of ["boot.py", "main.py"]) {
-      if (await this.isFilePath(path.join(localFolder, entrypoint))) {
-        return true;
-      }
-    }
-    return false;
   }
 
   private async isFilePath(targetPath: string): Promise<boolean> {
@@ -1458,12 +1537,34 @@ export class CalSciExtensionController implements vscode.Disposable {
     await this.persistSelectedPort(result.port || preferredPort || undefined);
     await this.pollDevices();
     if (result.ok) {
-      await this.ensureSessionForSelection({ force: true, notifyOnError: false, showTerminal: false });
       const flashedPort = result.port || preferredPort;
-      if (preferredPort && flashedPort !== preferredPort) {
-        void vscode.window.showInformationMessage(`Firmware flash complete. Device port changed to ${flashedPort}.`);
+      const postFlashReset = flashedPort ? await this.restorePromptAfterFirmwareFlash(flashedPort) : undefined;
+
+      if (postFlashReset?.ok && postFlashReset.promptSeen) {
+        if (preferredPort && flashedPort !== preferredPort) {
+          void vscode.window.showInformationMessage(
+            `Firmware flash complete. Device port changed to ${flashedPort}. CalSci prompt verified.`,
+          );
+        } else {
+          void vscode.window.showInformationMessage(`Firmware flash complete on ${flashedPort}. CalSci prompt verified.`);
+        }
+      } else if (flashedPort) {
+        const detail = postFlashReset?.error
+          ? ` ${postFlashReset.error}`
+          : postFlashReset?.rebootSeen
+            ? " Device reboot detected, but the CalSci prompt was not yet verified."
+            : "";
+        if (preferredPort && flashedPort !== preferredPort) {
+          void vscode.window.showWarningMessage(
+            `Firmware flash complete. Device port changed to ${flashedPort}, but post-flash serial reset did not restore the CalSci prompt.${detail}`,
+          );
+        } else {
+          void vscode.window.showWarningMessage(
+            `Firmware flash complete on ${flashedPort}, but post-flash serial reset did not restore the CalSci prompt.${detail}`,
+          );
+        }
       } else {
-        void vscode.window.showInformationMessage(`Firmware flash complete on ${flashedPort}.`);
+        void vscode.window.showInformationMessage("Firmware flash complete.");
       }
       return;
     }
@@ -1584,7 +1685,7 @@ export class CalSciExtensionController implements vscode.Disposable {
             this.firmwareOutput.appendLine("----");
           }
           this.firmwareOutput.appendLine(`CalSci firmware flash target: ${port || "auto-detect ESP port"}`);
-          this.firmwareOutput.appendLine(`Mode:            ${manualBootloader ? "manual bootloader retry" : "automatic USB reset"}`);
+          this.firmwareOutput.appendLine(`Mode:            ${manualBootloader ? "manual bootloader retry" : "automatic bootloader entry"}`);
           this.firmwareOutput.appendLine(`Bootloader:      ${firmwarePaths.bootloaderPath}`);
           this.firmwareOutput.appendLine(`Partition table: ${firmwarePaths.partitionTablePath}`);
           this.firmwareOutput.appendLine(`OTA data:        ${firmwarePaths.otaDataPath}`);
@@ -1634,7 +1735,7 @@ export class CalSciExtensionController implements vscode.Disposable {
             this.chipEraseOutput.appendLine("----");
           }
           this.chipEraseOutput.appendLine(`CalSci chip erase target: ${port || "auto-detect ESP port"}`);
-          this.chipEraseOutput.appendLine(`Mode: ${manualBootloader ? "manual bootloader retry" : "automatic USB reset"}`);
+          this.chipEraseOutput.appendLine(`Mode: ${manualBootloader ? "manual bootloader retry" : "automatic bootloader entry"}`);
           this.chipEraseOutput.appendLine("");
           this.chipEraseOutput.show(false);
 

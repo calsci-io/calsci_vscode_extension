@@ -110,6 +110,7 @@ FIRMWARE_FLASH_OTA_DATA_OFFSET = "0xe000"
 FIRMWARE_FLASH_CALOS_OFFSET = "0x10000"
 FIRMWARE_FLASH_PORT_RESCAN_TIMEOUT_SEC = 12.0
 FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC = 0.5
+FIRMWARE_FLASH_AUTO_BOOT_TIMEOUT_SEC = 15.0
 FIRMWARE_FLASH_MANUAL_BOOT_TIMEOUT_SEC = 60.0
 ESP32_KEYWORDS = ("Espressif", CALSCI_PRODUCT)
 SOFT_RESET_REBOOT_MARKERS = (
@@ -1323,6 +1324,17 @@ class CalSciController:
             "output": b"".join(output_chunks).decode("utf-8", errors="replace"),
         }
 
+    def request_bootloader(self) -> None:
+        self._drain_serial_input()
+        try:
+            self._enter_raw_repl(timeout_overall=RAW_REPL_ENTER_TIMEOUT_SEC)
+            self._exec_raw_no_follow("import machine\r\nmachine.bootloader()\r\n")
+            time.sleep(0.05)
+        except Exception:
+            self._in_raw_repl = False
+            raise
+        self._in_raw_repl = False
+
 
 class PersistentSession:
     def __init__(
@@ -1468,6 +1480,63 @@ class PersistentSession:
         if payload.get("output"):
             self._emit_terminal_text(str(payload["output"]))
         return payload
+
+    def request_bootloader(
+        self,
+        port: str | None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        requested_port = str(port or "").strip()
+        with self._lock:
+            session_port = self._port
+            controller = self._controller
+
+        if controller is None or not session_port:
+            return {
+                "ok": False,
+                "prepared": False,
+                "skipped": True,
+                "port": requested_port,
+            }
+
+        if requested_port and session_port != requested_port:
+            return {
+                "ok": False,
+                "prepared": False,
+                "skipped": True,
+                "port": requested_port,
+                "sessionPort": session_port,
+            }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "prepared": False,
+                    "port": requested_port or session_port,
+                    "error": str(exc),
+                }
+
+            try:
+                if progress_callback is not None:
+                    progress_callback(f"Requesting bootloader mode via active CalSci session on {controller.port}...")
+                controller.request_bootloader()
+                return {
+                    "ok": True,
+                    "prepared": True,
+                    "port": controller.port,
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "prepared": False,
+                    "port": controller.port,
+                    "error": str(exc),
+                }
+            finally:
+                self._end_exclusive_operation(pause_requested)
 
     def run_file(
         self,
@@ -3206,6 +3275,47 @@ class JobDispatcher:
             self._active_run_request_id = None
             self._active_run_cancel = None
 
+    def _prepare_bootloader_for_flash_operation(
+        self,
+        requested_port: str,
+        *,
+        manual_bootloader: bool,
+        close_reason: str,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> tuple[str, bool]:
+        target_port = str(requested_port or "").strip()
+        bootloader_ready = False
+        prepare_result: dict[str, Any] | None = None
+
+        if not manual_bootloader:
+            prepare_result = self._session.request_bootloader(
+                port=target_port or None,
+                progress_callback=progress_callback,
+            )
+
+        self._session.close(reason=close_reason)
+
+        if manual_bootloader:
+            return target_port, False
+
+        if prepare_result and prepare_result.get("ok") and prepare_result.get("prepared"):
+            target_port = str(prepare_result.get("port") or target_port)
+            try:
+                target_port = _wait_for_bootloader_ready(
+                    target_port,
+                    progress_callback=progress_callback,
+                    timeout_seconds=FIRMWARE_FLASH_AUTO_BOOT_TIMEOUT_SEC,
+                    wait_message="Waiting for automatic bootloader confirmation...",
+                )
+                bootloader_ready = True
+            except Exception as exc:
+                if progress_callback is not None:
+                    progress_callback(f"Automatic bootloader request did not confirm: {exc}. Falling back to host reset.")
+        elif prepare_result and prepare_result.get("error") and progress_callback is not None:
+            progress_callback(f"Automatic bootloader request failed: {prepare_result['error']}. Falling back to host reset.")
+
+        return target_port, bootloader_ready
+
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -3326,30 +3436,44 @@ class JobDispatcher:
                     ) if job.stream else None,
                 )
             if job.command == "chip.erase":
-                self._session.close(reason="chip-erase")
-                return erase_chip(
-                    port=_optional_arg_string(args, "port") or "",
+                progress_callback = (
+                    lambda line, req_id=job.request_id: _service_emit(
+                        {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
+                    )
+                ) if job.stream else None
+                erase_port, bootloader_ready = self._prepare_bootloader_for_flash_operation(
+                    _optional_arg_string(args, "port") or "",
                     manual_bootloader=bool(args.get("manualBootloader", False)),
-                    progress_callback=(
-                        lambda line, req_id=job.request_id: _service_emit(
-                            {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
-                        )
-                    ) if job.stream else None,
+                    close_reason="chip-erase",
+                    progress_callback=progress_callback,
+                )
+                return erase_chip(
+                    port=erase_port,
+                    manual_bootloader=bool(args.get("manualBootloader", False)),
+                    bootloader_ready=bootloader_ready,
+                    progress_callback=progress_callback,
                 )
             if job.command == "firmware.flash":
-                self._session.close(reason="firmware-flash")
+                progress_callback = (
+                    lambda line, req_id=job.request_id: _service_emit(
+                        {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
+                    )
+                ) if job.stream else None
+                flash_port, bootloader_ready = self._prepare_bootloader_for_flash_operation(
+                    _optional_arg_string(args, "port") or "",
+                    manual_bootloader=bool(args.get("manualBootloader", False)),
+                    close_reason="firmware-flash",
+                    progress_callback=progress_callback,
+                )
                 return flash_firmware_bundle(
-                    port=_optional_arg_string(args, "port") or "",
+                    port=flash_port,
                     bootloader_path=str(args["bootloaderPath"]),
                     calos_path=str(args["calOsPath"]),
                     partition_table_path=str(args["partitionTablePath"]),
                     ota_data_path=str(args["otaDataPath"]),
                     manual_bootloader=bool(args.get("manualBootloader", False)),
-                    progress_callback=(
-                        lambda line, req_id=job.request_id: _service_emit(
-                            {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
-                        )
-                    ) if job.stream else None,
+                    bootloader_ready=bootloader_ready,
+                    progress_callback=progress_callback,
                 )
             return {"ok": False, "error": f"Unsupported command: {job.command}"}
         except Exception as exc:
@@ -3768,46 +3892,64 @@ def _run_esptool_erase_with_connect_retries(
     raise last_error
 
 
+def _wait_for_bootloader_ready(
+    port: str,
+    progress_callback: Callable[[str], None] | None = None,
+    timeout_seconds: float = FIRMWARE_FLASH_AUTO_BOOT_TIMEOUT_SEC,
+    require_port_reset: bool = False,
+    wait_message: str | None = None,
+) -> str:
+    deadline = time.time() + max(1.0, timeout_seconds)
+    last_error = ""
+    current_port = port
+    missing_seen = False
+
+    if progress_callback is not None and wait_message:
+        progress_callback(wait_message)
+
+    while time.time() < deadline:
+        ports = _scan_esp_ports()
+        if current_port not in ports:
+            missing_seen = True
+        if current_port not in ports and ports:
+            if progress_callback is not None and ports[0] != current_port:
+                progress_callback(f"Port changed: {current_port} -> {ports[0]}")
+            current_port = ports[0]
+
+        if require_port_reset and not missing_seen:
+            time.sleep(FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC)
+            continue
+
+        try:
+            boot_cmd = _build_esptool_boot_cmd(port=current_port, before="no-reset", after="no-reset")
+            _run_esptool(boot_cmd, progress_callback=None)
+            if progress_callback is not None:
+                progress_callback("Bootloader confirmed.")
+            return _wait_for_esp_port(current_port, progress_callback=progress_callback)
+        except Exception as exc:
+            last_error = str(exc)
+
+        time.sleep(FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC)
+
+    if require_port_reset and not missing_seen:
+        raise ControllerError("Bootloader signal not detected (port did not reset)")
+    if last_error:
+        raise ControllerError(f"Bootloader confirmation timeout. {last_error[:160]}")
+    raise ControllerError("Bootloader confirmation timeout.")
+
+
 def _confirm_manual_bootloader(
     port: str,
     progress_callback: Callable[[str], None] | None = None,
     timeout_seconds: float = FIRMWARE_FLASH_MANUAL_BOOT_TIMEOUT_SEC,
 ) -> str:
-    deadline = time.time() + max(1.0, timeout_seconds)
-    last_error = ""
-    if progress_callback is not None:
-        progress_callback("Waiting for manual bootloader confirmation (hold BOOT, tap RESET, release BOOT)...")
-
-    missing_seen = False
-    while time.time() < deadline:
-        ports = _scan_esp_ports()
-        if port not in ports:
-            missing_seen = True
-        if missing_seen and ports:
-            if port not in ports:
-                if progress_callback is not None and ports[0] != port:
-                    progress_callback(f"Port changed: {port} -> {ports[0]}")
-                port = ports[0]
-            break
-        time.sleep(FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC)
-
-    if not missing_seen:
-        raise ControllerError("Bootloader signal not detected (port did not reset)")
-
-    while time.time() < deadline:
-        try:
-            boot_cmd = _build_esptool_boot_cmd(port=port, before="no-reset", after="no-reset")
-            _run_esptool(boot_cmd, progress_callback=None)
-            if progress_callback is not None:
-                progress_callback("Bootloader confirmed.")
-            return _wait_for_esp_port(port, progress_callback=progress_callback)
-        except Exception as exc:
-            last_error = str(exc)
-        time.sleep(FIRMWARE_FLASH_PORT_RESCAN_INTERVAL_SEC)
-
-    if last_error:
-        raise ControllerError(f"Bootloader confirmation timeout. {last_error[:160]}")
-    raise ControllerError("Bootloader confirmation timeout.")
+    return _wait_for_bootloader_ready(
+        port,
+        progress_callback=progress_callback,
+        timeout_seconds=timeout_seconds,
+        require_port_reset=True,
+        wait_message="Waiting for manual bootloader confirmation (hold BOOT, tap RESET, release BOOT)...",
+    )
 
 
 def flash_firmware_bundle(
@@ -3817,6 +3959,7 @@ def flash_firmware_bundle(
     partition_table_path: str,
     ota_data_path: str,
     manual_bootloader: bool = False,
+    bootloader_ready: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     requested_port = str(port or "").strip()
@@ -3858,12 +4001,18 @@ def flash_firmware_bundle(
 
     try:
         flash_port = _detect_initial_flash_port(requested_port, progress_callback=progress_callback)
+        use_no_reset = False
         if manual_bootloader:
             if progress_callback is not None:
                 progress_callback("Manual bootloader mode requested.")
             flash_port = _confirm_manual_bootloader(flash_port, progress_callback=progress_callback)
+            use_no_reset = True
+        elif bootloader_ready:
+            use_no_reset = True
+            if progress_callback is not None:
+                progress_callback("Automatic bootloader entry confirmed.")
         elif progress_callback is not None:
-            progress_callback("Using automatic USB reset mode.")
+            progress_callback("Using automatic bootloader entry mode.")
 
         if progress_callback is not None:
             progress_callback("Flashing bootloader + partition table + OTA data + CalOS...")
@@ -3871,7 +4020,7 @@ def flash_firmware_bundle(
             image_pairs,
             flash_port,
             progress_callback=progress_callback,
-            before_modes=("no-reset",) if manual_bootloader else None,
+            before_modes=("no-reset",) if use_no_reset else None,
         )
         if progress_callback is not None:
             progress_callback(f"Firmware flash complete on {flashed_port}")
@@ -3898,6 +4047,7 @@ def flash_firmware_bundle(
 def erase_chip(
     port: str,
     manual_bootloader: bool = False,
+    bootloader_ready: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     requested_port = str(port or "").strip()
@@ -3905,19 +4055,25 @@ def erase_chip(
 
     try:
         erase_port = _detect_initial_flash_port(requested_port, progress_callback=progress_callback)
+        use_no_reset = False
         if manual_bootloader:
             if progress_callback is not None:
                 progress_callback("Manual bootloader mode requested.")
             erase_port = _confirm_manual_bootloader(erase_port, progress_callback=progress_callback)
+            use_no_reset = True
+        elif bootloader_ready:
+            use_no_reset = True
+            if progress_callback is not None:
+                progress_callback("Automatic bootloader entry confirmed.")
         elif progress_callback is not None:
-            progress_callback("Using automatic USB reset mode.")
+            progress_callback("Using automatic bootloader entry mode.")
 
         if progress_callback is not None:
             progress_callback("Erasing chip flash...")
         erased_port = _run_esptool_erase_with_connect_retries(
             erase_port,
             progress_callback=progress_callback,
-            before_modes=("no-reset",) if manual_bootloader else None,
+            before_modes=("no-reset",) if use_no_reset else None,
         )
         if progress_callback is not None:
             progress_callback(f"Chip erase complete on {erased_port}")
