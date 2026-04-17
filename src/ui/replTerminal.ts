@@ -12,10 +12,14 @@ export class CalSciReplPseudoterminal implements vscode.Pseudoterminal, vscode.D
   private connectedPort: string | undefined;
   private disconnectedKey: string | undefined;
   private lastInputError: string | undefined;
+  private suppressNextConnectNotice = false;
 
   public readonly onDidWrite = this.writeEmitter.event;
 
-  constructor(private readonly backend: BackendServiceClient) {
+  constructor(
+    private readonly backend: BackendServiceClient,
+    private readonly inputHandler: (data: string) => Promise<void>,
+  ) {
     this.disposables.push(
       this.backend.onTerminalOutput((data: string) => {
         this.lastInputError = undefined;
@@ -38,7 +42,7 @@ export class CalSciReplPseudoterminal implements vscode.Pseudoterminal, vscode.D
   }
 
   public handleInput(data: string): void {
-    void this.backend.sendTerminalInput(data).then(
+    void this.inputHandler(data).then(
       () => {
         this.lastInputError = undefined;
       },
@@ -61,18 +65,28 @@ export class CalSciReplPseudoterminal implements vscode.Pseudoterminal, vscode.D
 
   private handleSessionState(state: SessionState): void {
     const port = state.port ?? undefined;
+    const reason = state.reason?.trim() || undefined;
     if (state.connected) {
       this.disconnectedKey = undefined;
       this.lastInputError = undefined;
       if (this.connectedPort !== port) {
         this.connectedPort = port;
-        this.writeLocalLine(`[Connected to ${port ?? "CalSci"}]`);
+        if (!this.suppressNextConnectNotice) {
+          this.writeLocalLine(`[Connected to ${port ?? "CalSci"}]`);
+        }
       }
+      this.suppressNextConnectNotice = false;
       return;
     }
 
     const error = state.error?.trim() || undefined;
-    const key = `${port ?? ""}|${error ?? ""}|${state.reason ?? ""}`;
+    const key = `${port ?? ""}|${error ?? ""}|${reason ?? ""}`;
+    if (!error && this.shouldSuppressSessionNotice(reason)) {
+      this.connectedPort = undefined;
+      this.disconnectedKey = key;
+      this.suppressNextConnectNotice = true;
+      return;
+    }
     if (this.connectedPort !== undefined || error) {
       if (this.disconnectedKey !== key) {
         this.writeLocalLine(`[Session closed${error ? `: ${error}` : ""}]`);
@@ -80,6 +94,14 @@ export class CalSciReplPseudoterminal implements vscode.Pseudoterminal, vscode.D
       }
     }
     this.connectedPort = undefined;
+    this.suppressNextConnectNotice = false;
+  }
+
+  private shouldSuppressSessionNotice(reason: string | undefined): boolean {
+    return reason === "idle-release"
+      || reason === "terminal-closed"
+      || reason === "closed-by-command"
+      || reason === "shutdown";
   }
 
   private writeLocalLine(text: string): void {

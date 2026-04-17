@@ -89,8 +89,18 @@ export class BackendServiceClient implements vscode.Disposable {
     return this.normalizeSessionResult(await this.request<SessionResult>("session.open", { port }));
   }
 
-  public async closeSession(): Promise<SessionResult> {
-    return this.normalizeSessionResult(await this.request<SessionResult>("session.close", {}));
+  public async closeSession(reason?: string): Promise<SessionResult> {
+    return this.normalizeSessionResult(await this.request<SessionResult>(
+      "session.close",
+      reason ? { reason } : {},
+    ));
+  }
+
+  public async abortSessionActivity(reason?: string): Promise<SessionResult> {
+    return this.normalizeSessionResult(await this.request<SessionResult>(
+      "session.abort",
+      reason ? { reason } : {},
+    ));
   }
 
   public async getSessionState(): Promise<SessionResult> {

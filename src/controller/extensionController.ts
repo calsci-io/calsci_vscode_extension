@@ -77,6 +77,9 @@ export class CalSciExtensionController implements vscode.Disposable {
   private pendingHybridRestorePort: string | undefined;
   private hybridRestoreInFlight = false;
   private recentTerminalOutput = "";
+  private terminalInteractionInFlight = false;
+  private terminalInputQueue: Promise<void> = Promise.resolve();
+  private disconnectHandlingInFlight = false;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.backend = new BackendServiceClient(context);
@@ -285,7 +288,7 @@ export class CalSciExtensionController implements vscode.Disposable {
 
     if (this.devices.length === 1) {
       await this.persistSelectedPort(this.devices[0].port);
-      await this.ensureSessionForPort(this.devices[0].port, { force: true, notifyOnError: true, showTerminal: true });
+      this.showReplTerminal(false);
       await this.pollDevices();
       return;
     }
@@ -307,7 +310,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
 
     await this.persistSelectedPort(choice.port);
-    await this.ensureSessionForPort(choice.port, { force: true, notifyOnError: true, showTerminal: true });
+    this.showReplTerminal(false);
     await this.pollDevices();
     void vscode.window.showInformationMessage(`Device selected: ${choice.port}`);
   }
@@ -1089,16 +1092,57 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
 
-    const connected = await this.ensureSessionForPort(port, {
-      force: false,
-      notifyOnError: true,
-      showTerminal: true,
-    });
-    if (!connected) {
+    this.showReplTerminal(false);
+  }
+
+  private queueTerminalInput(data: string): Promise<void> {
+    const pending = this.terminalInputQueue.then(() => this.sendTerminalInputToDevice(data));
+    this.terminalInputQueue = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
+  }
+
+  private async sendTerminalInputToDevice(data: string): Promise<void> {
+    if (!data) {
       return;
     }
+    if (!this.backendReady) {
+      throw new Error("CalSci backend is still initializing.");
+    }
+    if (this.operationInFlight > 0 || this.sessionOpenInFlight) {
+      throw new Error("CalSci is busy with another operation.");
+    }
+    if (this.pendingHybridRestorePort || this.hybridRestoreInFlight) {
+      throw new Error("CalSci is waiting for the previous interactive run to settle.");
+    }
 
-    this.showReplTerminal(false);
+    let port = this.selectedPort;
+    const selectedSessionOpen = Boolean(port && this.sessionState.connected && this.sessionState.port === port);
+    if (!selectedSessionOpen) {
+      port = await this.resolvePortForOperation();
+      const connected = await this.ensureSessionForPort(port, {
+        force: false,
+        notifyOnError: false,
+        showTerminal: false,
+      });
+      if (!connected) {
+        throw new Error(`Failed to open CalSci session on ${port}.`);
+      }
+    }
+
+    this.terminalInteractionInFlight = true;
+    this.refreshStatus();
+
+    try {
+      await this.backend.sendTerminalInput(data);
+      this.lastSessionError = undefined;
+    } catch (error) {
+      this.terminalInteractionInFlight = false;
+      this.refreshStatus();
+      throw error;
+    }
   }
 
   private async resolveFolderForSync(folderUri?: vscode.Uri): Promise<SyncFolderSelection | undefined> {
@@ -1308,6 +1352,10 @@ export class CalSciExtensionController implements vscode.Disposable {
 
   private handleTerminalOutput(data: string): void {
     this.recentTerminalOutput = (this.recentTerminalOutput + data).slice(-256);
+    if (this.terminalInteractionInFlight && this.terminalBufferHasFriendlyPrompt()) {
+      this.terminalInteractionInFlight = false;
+      this.refreshStatus();
+    }
     void this.tryRestoreHybridAfterPrompt();
   }
 
@@ -1856,11 +1904,12 @@ export class CalSciExtensionController implements vscode.Disposable {
   }
 
   private async pollDevices(options?: PollOptions): Promise<void> {
-    if (!this.backendReady || this.pollInFlight || this.operationInFlight > 0 || this.sessionOpenInFlight) {
+    if (!this.backendReady || this.pollInFlight || this.sessionOpenInFlight) {
       return;
     }
 
     const allowSessionConnect = options?.allowSessionConnect ?? this.shouldAutoConnectOnDetect();
+    const operationActive = this.operationInFlight > 0 || this.runInFlight || this.terminalInteractionInFlight;
     this.pollInFlight = true;
     try {
       const result = await this.backend.scan();
@@ -1874,12 +1923,21 @@ export class CalSciExtensionController implements vscode.Disposable {
       }
 
       this.devices = result.devices ?? [];
-      await this.reconcileSelectedPort();
+      const disconnectedPort = this.reconcileSelectedPort();
+      if (disconnectedPort) {
+        await this.handleSelectedPortDisconnected(disconnectedPort);
+        return;
+      }
 
       if (!this.selectedPort) {
         if (this.sessionState.connected) {
           await this.closeSessionSilently();
         }
+        this.refreshStatus();
+        return;
+      }
+
+      if (operationActive) {
         this.refreshStatus();
         return;
       }
@@ -1904,13 +1962,58 @@ export class CalSciExtensionController implements vscode.Disposable {
     }
   }
 
-  private async reconcileSelectedPort(): Promise<void> {
-    if (this.selectedPort) {
-      const stillAvailable = this.devices.some((device) => device.port === this.selectedPort);
-      if (stillAvailable) {
-        return;
+  private reconcileSelectedPort(): string | undefined {
+    if (!this.selectedPort) {
+      return undefined;
+    }
+    const stillAvailable = this.devices.some((device) => device.port === this.selectedPort);
+    return stillAvailable ? undefined : this.selectedPort;
+  }
+
+  private async handleSelectedPortDisconnected(port: string): Promise<void> {
+    if (this.disconnectHandlingInFlight) {
+      return;
+    }
+    if (this.selectedPort !== port && this.sessionState.port !== port) {
+      return;
+    }
+
+    this.disconnectHandlingInFlight = true;
+    const message = `CalSci device on ${port} disconnected.`;
+    try {
+      this.pendingHybridRestorePort = undefined;
+      this.hybridRestoreInFlight = false;
+      this.recentTerminalOutput = "";
+      this.terminalInteractionInFlight = false;
+      this.terminalInputQueue = Promise.resolve();
+
+      try {
+        await this.backend.abortSessionActivity("device-disconnected");
+      } catch {
+        // Best effort only.
       }
+
+      this.sessionState = {
+        connected: false,
+        error: message,
+        reason: "device-disconnected",
+      };
+      this.lastSessionError = message;
+      this.hybridStatus = {
+        ...this.hybridStatus,
+        connected: false,
+        active: false,
+        port: undefined,
+        error: message,
+        reason: "device-disconnected",
+      };
+      this.hybridPanel?.updateSessionState(this.sessionState);
+      this.hybridPanel?.updateHybridStatus(this.hybridStatus);
       await this.persistSelectedPort(undefined);
+      this.refreshStatus();
+      void vscode.window.showWarningMessage(message);
+    } finally {
+      this.disconnectHandlingInFlight = false;
     }
   }
 
@@ -2021,13 +2124,14 @@ export class CalSciExtensionController implements vscode.Disposable {
     return this.ensureSessionForPort(port, { force: true, notifyOnError: false, showTerminal: true });
   }
 
-  private async closeSessionSilently(): Promise<void> {
+  private async closeSessionSilently(reason = "idle-release"): Promise<void> {
     try {
-      await this.backend.closeSession();
+      await this.backend.closeSession(reason);
     } catch {
       // Best effort only.
     }
     this.sessionState = { connected: false };
+    this.terminalInteractionInFlight = false;
     this.refreshStatus();
   }
 
@@ -2042,7 +2146,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     if (this.operationInFlight > 0 || this.runInFlight || this.sessionOpenInFlight || this.hybridStatus.active) {
       return;
     }
-    await this.closeDetachedSessionIfIdle();
+    await this.closeSessionSilently("terminal-closed");
   }
 
   private handleSessionStateChange(state: SessionState): void {
@@ -2054,6 +2158,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       error: state.error?.trim() || undefined,
       reason: state.reason?.trim() || undefined,
     };
+    if (!this.sessionState.connected) {
+      this.terminalInteractionInFlight = false;
+    }
     if (this.sessionState.connected) {
       this.lastSessionError = undefined;
       this.hybridStatus = {
@@ -2093,6 +2200,10 @@ export class CalSciExtensionController implements vscode.Disposable {
       this.workspaceViewProvider.invalidate();
     }
     this.refreshStatus();
+
+    if (!this.sessionState.connected && previousConnected && previousPort && this.selectedPort === previousPort && state.reason === "reader-failed") {
+      void this.handleSelectedPortDisconnected(previousPort);
+    }
   }
 
   private handleHybridEvent(event: BackendHybridEventPayload): void {
@@ -2115,7 +2226,9 @@ export class CalSciExtensionController implements vscode.Disposable {
       return this.replTerminal;
     }
 
-    const pty = new CalSciReplPseudoterminal(this.backend);
+    const pty = new CalSciReplPseudoterminal(this.backend, async (data: string) => {
+      await this.queueTerminalInput(data);
+    });
     const terminal = vscode.window.createTerminal({
       name: "CalSci",
       iconPath: new vscode.ThemeIcon("chip"),
@@ -2134,7 +2247,11 @@ export class CalSciExtensionController implements vscode.Disposable {
   }
 
   private shouldMaintainPersistentSession(showTerminalOnConnect = false): boolean {
-    return showTerminalOnConnect || Boolean(this.replTerminal) || this.hybridStatus.active;
+    return showTerminalOnConnect
+      || this.hybridStatus.active
+      || this.hybridRestoreInFlight
+      || Boolean(this.pendingHybridRestorePort)
+      || this.terminalInteractionInFlight;
   }
 
   private refreshStatus(): void {
@@ -2169,7 +2286,7 @@ export class CalSciExtensionController implements vscode.Disposable {
       return;
     }
 
-    const reason = this.lastSessionError ?? "Selected device is available. Opening persistent REPL session.";
+    const reason = this.lastSessionError ?? "Selected device is available. CalSci opens the serial session on demand.";
     this.setSelectedStatus(this.selectedPort, reason);
   }
 

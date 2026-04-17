@@ -160,6 +160,10 @@ class RunCancelledError(ControllerError):
         self.output = output
 
 
+class SessionAbortedError(ControllerError):
+    pass
+
+
 class RawLineSink:
     def __init__(self, emit: Callable[[str], None]):
         self._emit = emit
@@ -203,6 +207,24 @@ def _normalize_friendly_paste_source(source: str | bytes) -> bytes:
     else:
         text = source
     return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def _is_disconnect_error_text(error_text: str) -> bool:
+    lowered = error_text.lower()
+    needles = (
+        "input/output error",
+        "could not open port",
+        "no such file or directory",
+        "attempting to use a port that is not open",
+        "device reports readiness to read but returned no data",
+        "device disconnected",
+        "session aborted",
+    )
+    return any(needle in lowered for needle in needles)
+
+
+def _should_abort_for_exception(exc: Exception) -> bool:
+    return isinstance(exc, SessionAbortedError) or _is_disconnect_error_text(str(exc))
 
 
 def _extract_state_payloads(text: str) -> list[dict[str, Any]]:
@@ -431,8 +453,13 @@ class CalSciController:
         self._baudrate = baudrate
         self._exclusive = exclusive
         self._in_raw_repl = False
+        self._aborted = False
         self._write_lock = threading.Lock()
         self._conn = self._open_connection()
+
+    def abort(self) -> None:
+        self._aborted = True
+        self.close()
 
     def close(self) -> None:
         try:
@@ -440,7 +467,12 @@ class CalSciController:
         except Exception:
             pass
 
+    def _ensure_active(self) -> None:
+        if self._aborted:
+            raise SessionAbortedError("CalSci device disconnected.")
+
     def _open_connection(self) -> serial.Serial:
+        self._ensure_active()
         conn = serial.Serial()
         conn.port = self.port
         conn.baudrate = self._baudrate
@@ -480,6 +512,7 @@ class CalSciController:
             raise ControllerError(f"Could not exclusively lock port {self.port}: {exc}") from exc
 
     def sync_reconnect(self, delay_seconds: float = SYNC_FILE_RETRY_RECONNECT_DELAY_SEC) -> None:
+        self._ensure_active()
         with self._write_lock:
             try:
                 self._conn.dtr = False
@@ -497,6 +530,7 @@ class CalSciController:
             self._in_raw_repl = False
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
+            self._ensure_active()
             self._conn = self._open_connection()
 
     def write_terminal(self, data: bytes) -> None:
@@ -505,12 +539,15 @@ class CalSciController:
         self._write_bytes(data, flush=True)
 
     def read_terminal_chunk(self) -> bytes:
+        self._ensure_active()
         waiting = int(getattr(self._conn, "in_waiting", 0) or 0)
         return self._conn.read(waiting if waiting > 0 else 1)
 
     def drain_terminal_available(self) -> bytes:
+        self._ensure_active()
         drained = bytearray()
         while True:
+            self._ensure_active()
             waiting = int(getattr(self._conn, "in_waiting", 0) or 0)
             if waiting <= 0:
                 break
@@ -524,13 +561,16 @@ class CalSciController:
     def _write_bytes(self, data: bytes, flush: bool = True) -> None:
         if not data:
             return
+        self._ensure_active()
         last_exc: Exception | None = None
         for attempt in range(BACKEND_WRITE_RETRIES):
             try:
+                self._ensure_active()
                 with self._write_lock:
                     sent = 0
                     view = memoryview(data)
                     while sent < len(view):
+                        self._ensure_active()
                         wrote = self._conn.write(view[sent:])
                         if wrote is None:
                             wrote = 0
@@ -547,6 +587,7 @@ class CalSciController:
             raise last_exc
 
     def _drain_serial_input(self) -> None:
+        self._ensure_active()
         try:
             self._conn.reset_input_buffer()
             self._conn.reset_output_buffer()
@@ -556,6 +597,7 @@ class CalSciController:
 
         deadline = time.monotonic() + 0.2
         while time.monotonic() < deadline:
+            self._ensure_active()
             chunk = self.read_terminal_chunk()
             if not chunk:
                 break
@@ -564,6 +606,7 @@ class CalSciController:
         deadline = time.monotonic() + max(0.05, timeout)
         out = bytearray()
         while len(out) < size and time.monotonic() < deadline:
+            self._ensure_active()
             chunk = self._conn.read(size - len(out))
             if chunk:
                 out.extend(chunk)
@@ -585,6 +628,7 @@ class CalSciController:
         cancel_deadline: float | None = None
         cancel_triggered = False
         while True:
+            self._ensure_active()
             if data.endswith(ending):
                 return bytes(data)
 
@@ -1348,6 +1392,7 @@ class PersistentSession:
         self._emit_hybrid_event = emit_hybrid_event
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
+        self._abort_requested = threading.Event()
         self._controller: CalSciController | None = None
         self._port: str | None = None
         self._reader_thread: threading.Thread | None = None
@@ -1381,6 +1426,10 @@ class PersistentSession:
     def state(self) -> dict[str, Any]:
         with self._lock:
             return self._build_state_locked()
+
+    def _raise_if_abort_requested(self) -> None:
+        if self._abort_requested.is_set():
+            raise SessionAbortedError("CalSci device disconnected.")
 
     def open(self, port: str) -> dict[str, Any]:
         if not port:
@@ -1417,10 +1466,19 @@ class PersistentSession:
             self._emit_hybrid_status_event(reason=reason)
         return payload
 
+    def abort(self, reason: str = "aborted") -> dict[str, Any]:
+        self._abort_requested.set()
+        with self._lock:
+            controller = self._controller
+        if controller is not None:
+            controller.abort()
+        return self.close(reason=reason)
+
     def terminal_write(self, data: str) -> dict[str, Any]:
         if not data:
             return {"ok": True}
 
+        self._raise_if_abort_requested()
         with self._lock:
             controller = self._controller
         if controller is None:
@@ -1629,7 +1687,8 @@ class PersistentSession:
                         "output": "",
                         "error": str(exc),
                     }
-                    recovery_payload = _recover_after_run_failure(controller)
+                    if not _should_abort_for_exception(exc):
+                        recovery_payload = _recover_after_run_failure(controller)
             finally:
                 self._end_exclusive_operation(pause_requested)
 
@@ -1712,7 +1771,8 @@ class PersistentSession:
                     "localFile": str(local_path),
                     "error": str(exc),
                 }
-                recovery_payload = controller.recover_friendly_prompt(FRIENDLY_PASTE_RECOVERY_TIMEOUT_SEC)
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = controller.recover_friendly_prompt(FRIENDLY_PASTE_RECOVERY_TIMEOUT_SEC)
             finally:
                 self._end_exclusive_operation(pause_requested)
 
@@ -1804,6 +1864,7 @@ class PersistentSession:
                 remote_scan_error: Exception | None = None
 
                 for attempt in range(2):
+                    self._raise_if_abort_requested()
                     try:
                         remote_sizes = _read_remote_file_sizes(controller, remote_root)
                         report(f"CalSci has {len(remote_sizes)} file(s)")
@@ -1811,6 +1872,8 @@ class PersistentSession:
                         break
                     except ControllerError as exc:
                         remote_scan_error = exc
+                        if _should_abort_for_exception(exc):
+                            raise
                         if attempt == 0:
                             scan_recovery = _recover_after_run_failure(controller)
                             if scan_recovery.get("output"):
@@ -1851,6 +1914,7 @@ class PersistentSession:
                 if to_delete:
                     report(f"Deleting {len(to_delete)} stale file(s)…")
                     for index, remote_path in enumerate(to_delete, start=1):
+                        self._raise_if_abort_requested()
                         try:
                             if controller.sync_delete_file(remote_path):
                                 deleted_count += 1
@@ -1859,6 +1923,8 @@ class PersistentSession:
                                 delete_failures.append(remote_path)
                                 report(f"[{index}/{len(to_delete)}] Failed: {remote_path}")
                         except Exception as exc:
+                            if _should_abort_for_exception(exc):
+                                raise
                             delete_failures.append(remote_path)
                             report(f"[{index}/{len(to_delete)}] Failed: {remote_path} ({exc})")
 
@@ -1872,6 +1938,7 @@ class PersistentSession:
                     ]
                     report("Creating folder structure…")
                     for device_dir in device_dirs:
+                        self._raise_if_abort_requested()
                         try:
                             if controller.sync_mkdir(device_dir):
                                 report(f"  + {device_dir}")
@@ -1879,6 +1946,8 @@ class PersistentSession:
                                 directory_failures.append(device_dir)
                                 report(f"  ! {device_dir} (failed)")
                         except Exception as exc:
+                            if _should_abort_for_exception(exc):
+                                raise
                             directory_failures.append(device_dir)
                             report(f"  ! {device_dir} ({exc})")
                     report("Folder structure synced ✓")
@@ -1891,6 +1960,7 @@ class PersistentSession:
 
                     try:
                         for index, file_info in enumerate(sorted(to_upload, key=lambda item: str(item["remote_path"])), start=1):
+                            self._raise_if_abort_requested()
                             local_path = Path(file_info["local_path"])
                             relative_path = str(file_info["relative_path"])
                             remote_path = str(file_info["remote_path"])
@@ -1899,6 +1969,7 @@ class PersistentSession:
                             uploaded = False
 
                             for attempt in range(SYNC_FILE_RETRY_COUNT):
+                                self._raise_if_abort_requested()
                                 try:
                                     if not raw_upload_open:
                                         controller.sync_enter_raw_repl()
@@ -1910,6 +1981,8 @@ class PersistentSession:
                                     uploaded = True
                                     break
                                 except Exception as exc:
+                                    if _should_abort_for_exception(exc):
+                                        raise SessionAbortedError(str(exc)) from exc
                                     if raw_upload_open:
                                         try:
                                             controller.sync_exit_raw_repl()
@@ -1924,6 +1997,8 @@ class PersistentSession:
                                                 reconnect()
                                                 retry_detail = " after connection reset"
                                             except Exception as reconnect_exc:
+                                                if _should_abort_for_exception(reconnect_exc):
+                                                    raise SessionAbortedError(str(reconnect_exc)) from reconnect_exc
                                                 retry_detail = f" after failed connection reset ({reconnect_exc})"
                                         report(f"[{index}/{len(to_upload)}] Retry: {relative_path} ({exc}){retry_detail}")
                                         time.sleep(SYNC_FILE_RETRY_DELAY_SEC)
@@ -1991,7 +2066,8 @@ class PersistentSession:
                     "remoteFolder": directories[0],
                     "error": str(exc),
                 }
-                recovery_payload = _recover_after_run_failure(controller)
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
             finally:
                 try:
                     if bool(getattr(controller, "_in_raw_repl", False)):
@@ -2114,7 +2190,8 @@ class PersistentSession:
                     "bootCreated": False,
                     "error": str(exc),
                 }
-                recovery_payload = _recover_after_run_failure(controller)
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
             finally:
                 try:
                     if bool(getattr(controller, "_in_raw_repl", False)):
@@ -2196,7 +2273,8 @@ class PersistentSession:
                     "entries": [],
                     "error": str(exc),
                 }
-                recovery_payload = _recover_after_run_failure(controller)
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
             finally:
                 self._end_exclusive_operation(pause_requested)
 
@@ -2264,7 +2342,8 @@ class PersistentSession:
                     "remotePath": normalized_remote_path,
                     "error": str(exc),
                 }
-                recovery_payload = _recover_after_run_failure(controller)
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
             finally:
                 self._end_exclusive_operation(pause_requested)
 
@@ -2347,6 +2426,7 @@ class PersistentSession:
 
                 ensured_dirs = 0
                 for remote_dir in remote_dirs:
+                    self._raise_if_abort_requested()
                     relative_dir = _sync_device_relative_path(remote_dir)
                     if not relative_dir:
                         continue
@@ -2357,6 +2437,7 @@ class PersistentSession:
                 imported_files = 0
                 sorted_files = sorted(remote_files.items())
                 for index, (remote_path, file_size) in enumerate(sorted_files, start=1):
+                    self._raise_if_abort_requested()
                     relative_file = _sync_device_relative_path(remote_path)
                     local_path = local_root / Path(relative_file)
                     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2390,7 +2471,8 @@ class PersistentSession:
                     "localFolder": str(local_root),
                     "error": str(exc),
                 }
-                recovery_payload = _recover_after_run_failure(controller)
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
             finally:
                 try:
                     if bool(getattr(controller, "_in_raw_repl", False)):
@@ -3034,6 +3116,7 @@ class PersistentSession:
         self._emit_hybrid_status_event(reason=reason, error=error)
 
     def _attach_session_locked(self, controller: CalSciController) -> None:
+        self._abort_requested.clear()
         stop_event = threading.Event()
         pause_requested = threading.Event()
         paused_event = threading.Event()
@@ -3144,6 +3227,7 @@ class PersistentSession:
 
     def _handle_reader_failure(self, controller: CalSciController, error: str) -> None:
         detached = None
+        self._abort_requested.set()
         with self._lock:
             if self._controller is not controller:
                 return
@@ -3153,6 +3237,7 @@ class PersistentSession:
         self._emit_session_state_event(error=error, reason="reader-failed")
 
     def _begin_exclusive_operation(self) -> tuple[CalSciController, threading.Event]:
+        self._raise_if_abort_requested()
         with self._lock:
             controller = self._controller
             pause_requested = self._reader_pause_requested
@@ -3165,6 +3250,8 @@ class PersistentSession:
         if not paused_event.wait(timeout=READER_PAUSE_WAIT_SEC):
             pause_requested.clear()
             raise ControllerError("Session reader did not pause in time.")
+
+        self._raise_if_abort_requested()
 
         # Drop any buffered async output before running an exclusive command.
         # This avoids mixing stale terminal traffic into raw REPL command output.
@@ -3263,6 +3350,17 @@ class JobDispatcher:
                 "requestId": self._active_run_request_id,
             }
 
+    def abort_session_activity(self, reason: str = "aborted") -> dict[str, Any]:
+        cancel_result = self.cancel_active_run()
+        self._session.abort(reason=reason)
+        return {
+            "ok": True,
+            "connected": False,
+            "port": None,
+            "reason": reason,
+            "activeRunCancelled": bool(cancel_result.get("cancelled")),
+        }
+
     def _register_active_run(self, request_id: str, cancel_event: threading.Event) -> None:
         with self._active_run_lock:
             self._active_run_request_id = request_id
@@ -3342,7 +3440,8 @@ class JobDispatcher:
             if job.command == "session.open":
                 return self._session.open(port=str(args["port"]))
             if job.command == "session.close":
-                return self._session.close(reason="closed-by-command")
+                reason = str(args.get("reason") or "closed-by-command")
+                return self._session.close(reason=reason)
             if job.command == "session.state":
                 return {"ok": True, **self._session.state()}
             if job.command == "terminal.write":
@@ -4826,8 +4925,18 @@ def serve_loop() -> int:
             if command == "shutdown":
                 _service_emit({"id": request_id, "type": "result", "payload": {"ok": True}})
                 break
+            if command == "scan":
+                _service_emit({"id": request_id, "type": "result", "payload": {"ok": True, "devices": list_detected_esp_ports()}})
+                continue
             if command == "run.cancel":
                 _service_emit({"id": request_id, "type": "result", "payload": dispatcher.cancel_active_run()})
+                continue
+            if command == "session.abort":
+                _service_emit({
+                    "id": request_id,
+                    "type": "result",
+                    "payload": dispatcher.abort_session_activity(reason=str(args.get("reason") or "aborted")),
+                })
                 continue
 
             dispatcher.submit(request_id, command, args, stream)
