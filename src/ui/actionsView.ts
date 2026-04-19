@@ -88,6 +88,20 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
     icon: "sync",
   },
   {
+    id: "fetchWorkspace",
+    label: "Fetch All Files",
+    description: "Download the full CalSci workspace into a local folder with matching structure.",
+    command: "calsci.fetchWorkspace",
+    icon: "cloud-download",
+  },
+  {
+    id: "fetchWorkspacePartial",
+    label: "Partial Fetch",
+    description: "Choose CalSci files or folders to download into a local folder.",
+    command: "calsci.fetchWorkspacePartial",
+    icon: "filter",
+  },
+  {
     id: "clearAllFiles",
     label: "Clear All Files",
     description: "Delete all files from CalSci root and recreate empty boot.py.",

@@ -396,6 +396,48 @@ class SyncFolderTests(unittest.TestCase):
         self.assertEqual(backend._sync_device_absolute_path("db/test.json"), "/db/test.json")
         self.assertEqual(backend._sync_device_absolute_path("/"), "/")
 
+    def test_select_workspace_entries_returns_all_when_unfiltered(self) -> None:
+        directories, files = backend._select_workspace_entries(
+            ["/apps", "/apps/demo"],
+            {
+                "/boot.py": 5,
+                "/apps/demo/main.py": 10,
+            },
+            None,
+        )
+        self.assertEqual(directories, ["/apps", "/apps/demo"])
+        self.assertEqual(
+            files,
+            {
+                "/apps/demo/main.py": 10,
+                "/boot.py": 5,
+            },
+        )
+
+    def test_select_workspace_entries_expands_selected_folder_and_file(self) -> None:
+        directories, files = backend._select_workspace_entries(
+            ["/apps", "/apps/demo", "/docs"],
+            {
+                "/apps/demo/main.py": 10,
+                "/apps/demo/lib/util.py": 20,
+                "/docs/readme.txt": 8,
+            },
+            ["/apps/demo", "/docs/readme.txt"],
+        )
+        self.assertEqual(directories, ["/apps", "/apps/demo", "/docs"])
+        self.assertEqual(
+            files,
+            {
+                "/apps/demo/lib/util.py": 20,
+                "/apps/demo/main.py": 10,
+                "/docs/readme.txt": 8,
+            },
+        )
+
+    def test_select_workspace_entries_rejects_missing_selection(self) -> None:
+        with self.assertRaises(ValueError):
+            backend._select_workspace_entries(["/apps"], {"/boot.py": 5}, ["/missing.py"])
+
     def test_local_file_signature_matches_fnv_helper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "x.txt"
