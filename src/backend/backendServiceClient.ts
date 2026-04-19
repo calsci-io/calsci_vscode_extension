@@ -253,12 +253,14 @@ export class BackendServiceClient implements vscode.Disposable {
     port: string,
     localFolder: string,
     onOutputLine: (line: string, isError: boolean) => void,
+    remotePaths?: string[],
   ): Promise<WorkspaceImportResult> {
     return this.request<WorkspaceImportResult>(
       "workspace.import",
       {
         port,
         localFolder,
+        remotePaths,
       },
       {
         stream: true,

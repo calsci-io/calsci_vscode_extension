@@ -25,6 +25,7 @@ import {
   type SessionState,
   type SoftResetResult,
   type WorkspaceFileResult,
+  type WorkspaceImportResult,
   type SyncFolderResult,
   type SyncFolderSelection,
   type WorkspaceTreeEntry,
@@ -49,6 +50,7 @@ export class CalSciExtensionController implements vscode.Disposable {
   private readonly firmwareOutput: vscode.OutputChannel;
   private readonly chipEraseOutput: vscode.OutputChannel;
   private readonly workspaceOutput: vscode.OutputChannel;
+  private readonly workspaceFetchOutput: vscode.OutputChannel;
   private readonly workspaceViewProvider: CalSciWorkspaceViewProvider;
   private readonly testingFolderViewProvider: CalSciTestingFolderViewProvider;
   private readonly workspaceContentProvider: CalSciWorkspaceContentProvider;
@@ -104,6 +106,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.firmwareOutput = vscode.window.createOutputChannel("CalSci Firmware Upload");
     this.chipEraseOutput = vscode.window.createOutputChannel("CalSci Chip Erase");
     this.workspaceOutput = vscode.window.createOutputChannel("CalSci Workspace");
+    this.workspaceFetchOutput = vscode.window.createOutputChannel("CalSci Workspace Fetch");
     this.workspaceContentProvider = new CalSciWorkspaceContentProvider();
     this.workspaceViewProvider = new CalSciWorkspaceViewProvider({
       scanTree: async () => this.scanWorkspaceTree(),
@@ -168,6 +171,7 @@ export class CalSciExtensionController implements vscode.Disposable {
       this.firmwareOutput,
       this.chipEraseOutput,
       this.workspaceOutput,
+      this.workspaceFetchOutput,
     );
     this.registerCommands();
     this.setInitializingStatus();
@@ -229,6 +233,7 @@ export class CalSciExtensionController implements vscode.Disposable {
     this.firmwareOutput.dispose();
     this.chipEraseOutput.dispose();
     this.workspaceOutput.dispose();
+    this.workspaceFetchOutput.dispose();
   }
 
   private registerCommands(): void {
@@ -256,6 +261,12 @@ export class CalSciExtensionController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand("calsci.syncFolder", async (uri?: vscode.Uri) => {
         await this.syncFolderCommand(uri);
+      }),
+      vscode.commands.registerCommand("calsci.fetchWorkspace", async () => {
+        await this.fetchWorkspaceCommand();
+      }),
+      vscode.commands.registerCommand("calsci.fetchWorkspacePartial", async () => {
+        await this.fetchWorkspacePartialCommand();
       }),
       vscode.commands.registerCommand("calsci.clearAllFiles", async () => {
         await this.clearAllFilesCommand();
@@ -935,6 +946,305 @@ export class CalSciExtensionController implements vscode.Disposable {
 
   private async refreshWorkspaceCommand(): Promise<void> {
     await this.workspaceViewProvider.reload();
+  }
+
+  private async fetchWorkspaceCommand(): Promise<void> {
+    const port = await this.prepareWorkspaceFetchPort();
+    if (!port) {
+      return;
+    }
+
+    const localFolder = await this.pickWorkspaceDestinationFolder();
+    if (!localFolder) {
+      return;
+    }
+
+    await this.importWorkspaceSelection(port, localFolder);
+  }
+
+  private async fetchWorkspacePartialCommand(): Promise<void> {
+    const port = await this.prepareWorkspaceFetchPort();
+    if (!port) {
+      return;
+    }
+
+    let entries: WorkspaceTreeEntry[];
+    try {
+      entries = await this.loadWorkspaceEntriesForFetch(port);
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Unable to load CalSci workspace."));
+      return;
+    }
+
+    const remotePaths = await this.pickWorkspaceEntriesForFetch(entries);
+    if (!remotePaths || remotePaths.length === 0) {
+      return;
+    }
+
+    const localFolder = await this.pickWorkspaceDestinationFolder();
+    if (!localFolder) {
+      return;
+    }
+
+    await this.importWorkspaceSelection(port, localFolder, remotePaths);
+  }
+
+  private async prepareWorkspaceFetchPort(): Promise<string | undefined> {
+    if (!this.backendReady) {
+      void vscode.window.showErrorMessage("CalSci backend is still initializing.");
+      return undefined;
+    }
+    if (this.runInFlight) {
+      void vscode.window.showWarningMessage("CalSci is busy with a run operation.");
+      return undefined;
+    }
+    if (this.operationInFlight > 0) {
+      void vscode.window.showWarningMessage("CalSci is busy with another operation.");
+      return undefined;
+    }
+
+    let port: string;
+    try {
+      port = await this.resolvePortForOperation();
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "No device selected."));
+      return undefined;
+    }
+
+    const connected = await this.ensureSessionForPort(port, { force: true, notifyOnError: true, showTerminal: true });
+    if (!connected) {
+      return undefined;
+    }
+    return port;
+  }
+
+  private async loadWorkspaceEntriesForFetch(port: string): Promise<WorkspaceTreeEntry[]> {
+    let result: WorkspaceTreeResult;
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `CalSci: Loading workspace from ${port}`,
+          cancellable: false,
+        },
+        async () => {
+          this.workspaceOutput.clear();
+          this.workspaceOutput.appendLine(`CalSci workspace scan on ${port}`);
+          this.workspaceOutput.appendLine("Remote root: /");
+          this.workspaceOutput.appendLine("");
+          this.workspaceOutput.show(false);
+          return this.backend.scanWorkspaceTree(port);
+        },
+      );
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+      await this.pollDevices();
+    }
+
+    this.workspaceOutput.show(false);
+    if (!result.ok) {
+      throw new Error(result.error ?? "Failed to scan CalSci workspace.");
+    }
+    return result.entries ?? [];
+  }
+
+  private async pickWorkspaceEntriesForFetch(entries: WorkspaceTreeEntry[]): Promise<string[] | undefined> {
+    if (entries.length === 0) {
+      void vscode.window.showInformationMessage("CalSci workspace is empty.");
+      return undefined;
+    }
+
+    type WorkspaceFetchItem = vscode.QuickPickItem & {
+      remotePath: string;
+    };
+
+    const picks: WorkspaceFetchItem[] = [...entries]
+      .sort((left, right) => {
+        if (left.kind !== right.kind) {
+          return left.kind === "directory" ? -1 : 1;
+        }
+        return left.path.localeCompare(right.path);
+      })
+      .map((entry) => {
+        const relativePath = entry.path.replace(/^\/+/, "");
+        const segments = relativePath ? relativePath.split("/") : ["/"];
+        const depth = Math.max(0, segments.length - 1);
+        const name = segments[segments.length - 1] || "/";
+        const icon = entry.kind === "directory" ? "$(folder)" : "$(file)";
+        return {
+          label: `${"  ".repeat(depth)}${icon} ${name}`,
+          description: entry.path,
+          detail: entry.kind === "directory" ? "Folder" : this.formatByteCount(entry.size ?? 0),
+          remotePath: entry.path,
+        };
+      });
+
+    const selected = await vscode.window.showQuickPick<WorkspaceFetchItem>(picks, {
+      canPickMany: true,
+      title: "CalSci: Partial Fetch",
+      placeHolder: "Select the CalSci files or folders to download",
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+
+    if (!selected || selected.length === 0) {
+      return undefined;
+    }
+
+    return selected.map((item) => item.remotePath);
+  }
+
+  private async pickWorkspaceDestinationFolder(): Promise<string | undefined> {
+    type DestinationChoice = vscode.QuickPickItem & {
+      action: "existing" | "new";
+    };
+
+    const choice = await vscode.window.showQuickPick<DestinationChoice>([
+      {
+        label: "$(folder-opened) Existing Folder",
+        detail: "Save the fetched CalSci files into an existing local folder.",
+        action: "existing",
+      },
+      {
+        label: "$(new-folder) New Folder",
+        detail: "Choose a parent folder, then create a new folder for the fetched CalSci files.",
+        action: "new",
+      },
+    ], {
+      title: "CalSci: Choose Save Location",
+      placeHolder: "Select where the fetched CalSci files should be saved",
+      ignoreFocusOut: true,
+    });
+
+    if (!choice) {
+      return undefined;
+    }
+
+    if (choice.action === "existing") {
+      return this.pickExistingWorkspaceDestinationFolder("Save CalSci Files", "CalSci: Select Folder to Save Files");
+    }
+
+    const parentFolder = await this.pickExistingWorkspaceDestinationFolder("Select Parent Folder", "CalSci: Select Parent Folder");
+    if (!parentFolder) {
+      return undefined;
+    }
+
+    const folderName = await vscode.window.showInputBox({
+      title: "CalSci: New Folder Name",
+      prompt: "Enter the name of the new folder for fetched CalSci files",
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const trimmed = value.trim();
+        if (!trimmed) {
+          return "Folder name is required.";
+        }
+        if (trimmed.includes("/") || trimmed.includes("\\")) {
+          return "Enter a folder name only, not a path.";
+        }
+        return undefined;
+      },
+    });
+    if (!folderName) {
+      return undefined;
+    }
+
+    const destination = path.resolve(parentFolder, folderName.trim());
+    try {
+      await fs.promises.mkdir(destination, { recursive: false });
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, `Unable to create folder ${destination}.`));
+      return undefined;
+    }
+    return destination;
+  }
+
+  private async pickExistingWorkspaceDestinationFolder(openLabel: string, title: string): Promise<string | undefined> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === "file");
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+      defaultUri: workspaceFolder?.uri,
+      openLabel,
+      title,
+    });
+    if (!picked || picked.length === 0) {
+      return undefined;
+    }
+    return path.resolve(picked[0].fsPath);
+  }
+
+  private async importWorkspaceSelection(
+    port: string,
+    localFolder: string,
+    remotePaths?: string[],
+  ): Promise<void> {
+    let result: WorkspaceImportResult;
+    const selectedCount = remotePaths?.length ?? 0;
+    const fetchTitle = remotePaths && remotePaths.length > 0
+      ? `CalSci: Fetching ${selectedCount} selected item(s) from ${port}`
+      : `CalSci: Fetching all files from ${port}`;
+
+    try {
+      this.operationInFlight += 1;
+      this.refreshStatus();
+      result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: fetchTitle,
+          cancellable: false,
+        },
+        async (progress) => {
+          this.workspaceFetchOutput.clear();
+          this.workspaceFetchOutput.appendLine(`CalSci workspace fetch on ${port}`);
+          this.workspaceFetchOutput.appendLine(`Local: ${localFolder}`);
+          this.workspaceFetchOutput.appendLine(
+            remotePaths && remotePaths.length > 0
+              ? `Selection: ${remotePaths.join(", ")}`
+              : "Selection: /",
+          );
+          this.workspaceFetchOutput.appendLine("");
+          this.workspaceFetchOutput.show(false);
+
+          return this.backend.importWorkspace(
+            port,
+            localFolder,
+            (line: string, isError: boolean) => {
+              const formatted = isError ? `[ERROR] ${line}` : line;
+              this.workspaceFetchOutput.appendLine(formatted);
+              progress.report({ message: formatted.slice(0, 100) });
+            },
+            remotePaths,
+          );
+        },
+      );
+    } catch (error) {
+      void vscode.window.showErrorMessage(this.errorMessage(error, "Workspace fetch failed."));
+      return;
+    } finally {
+      this.operationInFlight = Math.max(0, this.operationInFlight - 1);
+      this.refreshStatus();
+      this.testingFolderViewProvider.invalidate();
+      await this.pollDevices();
+    }
+
+    this.workspaceFetchOutput.show(false);
+    if (!result.ok) {
+      const detail = result.error ? ` ${result.error}` : "";
+      void vscode.window.showErrorMessage(`Workspace fetch failed on ${port}.${detail}`);
+      return;
+    }
+
+    const filesImported = result.filesImported ?? 0;
+    const directoriesImported = result.directoriesImported ?? 0;
+    const bytesImported = result.bytesImported ?? 0;
+    void vscode.window.showInformationMessage(
+      `CalSci fetch complete: ${filesImported} files and ${directoriesImported} folders saved to ${localFolder} (${this.formatByteCount(bytesImported)}).`,
+    );
   }
 
   private async scanWorkspaceTree(): Promise<{ port: string; entries: WorkspaceTreeEntry[] }> {

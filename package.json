@@ -42,6 +42,8 @@
     "onCommand:calsci.runCurrentFile",
     "onCommand:calsci.runInteractiveFile",
     "onCommand:calsci.syncFolder",
+    "onCommand:calsci.fetchWorkspace",
+    "onCommand:calsci.fetchWorkspacePartial",
     "onCommand:calsci.clearAllFiles",
     "onCommand:calsci.flashFirmware",
     "onCommand:calsci.eraseChip",
@@ -128,6 +130,14 @@
       {
         "command": "calsci.syncFolder",
         "title": "CalSci: Sync Folder"
+      },
+      {
+        "command": "calsci.fetchWorkspace",
+        "title": "CalSci: Fetch All Files"
+      },
+      {
+        "command": "calsci.fetchWorkspacePartial",
+        "title": "CalSci: Partial Fetch"
       },
       {
         "command": "calsci.refreshTestingFolder",

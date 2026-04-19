@@ -2373,6 +2373,7 @@ class PersistentSession:
         port: str | None,
         local_folder: str,
         progress_callback: Callable[[str], None] | None = None,
+        remote_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         local_root = Path(local_folder).expanduser().resolve()
         if local_root.exists() and not local_root.is_dir():
@@ -2422,10 +2423,11 @@ class PersistentSession:
 
                 report("Scanning CalSci workspace…")
                 remote_dirs, remote_files = controller.sync_scan_tree("/", timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC)
-                report(f"Found {len(remote_files)} file(s) and {len(remote_dirs)} folder(s)")
+                selected_dirs, selected_files = _select_workspace_entries(remote_dirs, remote_files, remote_paths)
+                report(f"Found {len(selected_files)} file(s) and {len(selected_dirs)} folder(s)")
 
                 ensured_dirs = 0
-                for remote_dir in remote_dirs:
+                for remote_dir in selected_dirs:
                     self._raise_if_abort_requested()
                     relative_dir = _sync_device_relative_path(remote_dir)
                     if not relative_dir:
@@ -2435,7 +2437,7 @@ class PersistentSession:
 
                 bytes_imported = 0
                 imported_files = 0
-                sorted_files = sorted(remote_files.items())
+                sorted_files = sorted(selected_files.items())
                 for index, (remote_path, file_size) in enumerate(sorted_files, start=1):
                     self._raise_if_abort_requested()
                     relative_file = _sync_device_relative_path(remote_path)
@@ -3528,6 +3530,7 @@ class JobDispatcher:
                 return self._session.import_workspace(
                     port=_optional_arg_string(args, "port"),
                     local_folder=str(args["localFolder"]),
+                    remote_paths=_optional_arg_string_list(args, "remotePaths"),
                     progress_callback=(
                         lambda line, req_id=job.request_id: _service_emit(
                             {"id": req_id, "type": "stream", "stream": "stdout", "line": line}
@@ -3585,6 +3588,18 @@ def _optional_arg_string(args: dict[str, Any], key: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _optional_arg_string_list(args: dict[str, Any], key: str) -> list[str] | None:
+    value = args.get(key)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = [value]
+    normalized = [str(item).strip() for item in items if str(item).strip()]
+    return normalized or None
 
 
 def _recover_after_run_failure(controller: CalSciController) -> dict[str, Any]:
@@ -4232,6 +4247,62 @@ def _sync_device_relative_path(remote_path: str) -> str:
 
 def _sync_device_absolute_path(remote_path: str) -> str:
     return _sync_core.sync_device_absolute_path(remote_path)
+
+
+def _select_workspace_entries(
+    remote_dirs: list[str],
+    remote_files: dict[str, int],
+    selected_paths: list[str] | None,
+) -> tuple[list[str], dict[str, int]]:
+    normalized_dirs = {
+        _sync_device_absolute_path(remote_dir)
+        for remote_dir in remote_dirs
+        if _sync_device_absolute_path(remote_dir) != "/"
+    }
+    normalized_files = {
+        _sync_device_absolute_path(remote_path): int(file_size)
+        for remote_path, file_size in remote_files.items()
+    }
+
+    if not selected_paths:
+        return sorted(normalized_dirs), dict(sorted(normalized_files.items()))
+
+    selected_dirs: set[str] = set()
+    selected_files: dict[str, int] = {}
+    normalized_selected: list[str] = []
+    for remote_path in selected_paths:
+        normalized_path = _sync_device_absolute_path(remote_path)
+        if normalized_path not in normalized_selected:
+            normalized_selected.append(normalized_path)
+
+    for normalized_path in normalized_selected:
+        if normalized_path == "/":
+            return sorted(normalized_dirs), dict(sorted(normalized_files.items()))
+
+        if normalized_path in normalized_files:
+            selected_files[normalized_path] = normalized_files[normalized_path]
+            parent = posixpath.dirname(normalized_path)
+            while parent and parent != "/":
+                if parent in normalized_dirs:
+                    selected_dirs.add(parent)
+                parent = posixpath.dirname(parent)
+            continue
+
+        if normalized_path in normalized_dirs:
+            prefix = f"{normalized_path.rstrip('/')}/"
+            selected_dirs.add(normalized_path)
+            for remote_dir in normalized_dirs:
+                if remote_dir.startswith(prefix):
+                    selected_dirs.add(remote_dir)
+            for remote_file, file_size in normalized_files.items():
+                if remote_file.startswith(prefix):
+                    selected_files[remote_file] = file_size
+            continue
+
+    if not selected_dirs and not selected_files:
+        raise ValueError("Selected CalSci files or folders were not found on the device.")
+
+    return sorted(selected_dirs), dict(sorted(selected_files.items()))
 
 
 def _fnv1a32_bytes(data: bytes) -> str:
