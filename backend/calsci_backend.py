@@ -4270,6 +4270,7 @@ def _select_workspace_entries(
     selected_dirs: set[str] = set()
     selected_files: dict[str, int] = {}
     normalized_selected: list[str] = []
+    missing_paths: list[str] = []
     for remote_path in selected_paths:
         normalized_path = _sync_device_absolute_path(remote_path)
         if normalized_path not in normalized_selected:
@@ -4304,8 +4305,13 @@ def _select_workspace_entries(
                     selected_files[remote_file] = file_size
             continue
 
+        missing_paths.append(normalized_path)
+
     if not selected_dirs and not selected_files:
-        raise ValueError("Selected CalSci files or folders were not found on the device.")
+        raise ValueError(
+            "Selected CalSci files or folders were not found on the device: "
+            + ", ".join(missing_paths or normalized_selected)
+        )
 
     return sorted(selected_dirs), dict(sorted(selected_files.items()))
 
