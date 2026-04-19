@@ -4291,6 +4291,11 @@ def _select_workspace_entries(
         if normalized_path in normalized_dirs:
             prefix = f"{normalized_path.rstrip('/')}/"
             selected_dirs.add(normalized_path)
+            parent = posixpath.dirname(normalized_path)
+            while parent and parent != "/":
+                if parent in normalized_dirs:
+                    selected_dirs.add(parent)
+                parent = posixpath.dirname(parent)
             for remote_dir in normalized_dirs:
                 if remote_dir.startswith(prefix):
                     selected_dirs.add(remote_dir)
