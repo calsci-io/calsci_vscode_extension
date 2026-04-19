@@ -39,6 +39,8 @@ import { CalSciTestingFolderViewProvider } from "../ui/testingFolderView";
 import { CalSciWorkspaceContentProvider, createCalSciWorkspaceUri } from "../ui/workspaceContentProvider";
 import { CalSciWorkspaceViewProvider } from "../ui/workspaceView";
 
+const MAX_PROGRESS_MESSAGE_LENGTH = 100;
+
 export class CalSciExtensionController implements vscode.Disposable {
   private readonly backend: BackendServiceClient;
   private readonly statusItem: vscode.StatusBarItem;
@@ -808,7 +810,7 @@ export class CalSciExtensionController implements vscode.Disposable {
             (line: string, isError: boolean) => {
               const formatted = isError ? `[ERROR] ${line}` : line;
               this.syncOutput.appendLine(formatted);
-              progress.report({ message: formatted.slice(0, 100) });
+              progress.report({ message: formatted.slice(0, MAX_PROGRESS_MESSAGE_LENGTH) });
             },
           );
         },
@@ -899,7 +901,7 @@ export class CalSciExtensionController implements vscode.Disposable {
           return this.backend.clearAllFiles(port, (line: string, isError: boolean) => {
             const formatted = isError ? `[ERROR] ${line}` : line;
             this.cleanupOutput.appendLine(formatted);
-            progress.report({ message: formatted.slice(0, 100) });
+            progress.report({ message: formatted.slice(0, MAX_PROGRESS_MESSAGE_LENGTH) });
           });
         },
       );
@@ -1216,7 +1218,7 @@ export class CalSciExtensionController implements vscode.Disposable {
             (line: string, isError: boolean) => {
               const formatted = isError ? `[ERROR] ${line}` : line;
               this.workspaceFetchOutput.appendLine(formatted);
-              progress.report({ message: formatted.slice(0, 100) });
+              progress.report({ message: formatted.slice(0, MAX_PROGRESS_MESSAGE_LENGTH) });
             },
             remotePaths,
           );
@@ -2057,7 +2059,7 @@ export class CalSciExtensionController implements vscode.Disposable {
             (line: string, isError: boolean) => {
               const formatted = isError ? `[ERROR] ${line}` : line;
               this.firmwareOutput.appendLine(formatted);
-              progress.report({ message: formatted.slice(0, 100) });
+              progress.report({ message: formatted.slice(0, MAX_PROGRESS_MESSAGE_LENGTH) });
             },
             { manualBootloader },
           );
@@ -2102,7 +2104,7 @@ export class CalSciExtensionController implements vscode.Disposable {
             (line: string, isError: boolean) => {
               const formatted = isError ? `[ERROR] ${line}` : line;
               this.chipEraseOutput.appendLine(formatted);
-              progress.report({ message: formatted.slice(0, 100) });
+              progress.report({ message: formatted.slice(0, MAX_PROGRESS_MESSAGE_LENGTH) });
             },
             { manualBootloader },
           );
