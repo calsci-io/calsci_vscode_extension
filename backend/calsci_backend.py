@@ -3594,8 +3594,10 @@ def _optional_arg_string_list(args: dict[str, Any], key: str) -> list[str] | Non
     value = args.get(key)
     if value is None:
         return None
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, (list, tuple)):
         items = value
+    elif isinstance(value, set):
+        items = sorted(value, key=str)
     else:
         items = [value]
     normalized = [str(item).strip() for item in items if str(item).strip()]
