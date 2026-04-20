@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import codecs
 import importlib.util
 import json
@@ -96,6 +97,7 @@ SYNC_TARGETED_VERIFY_MAX_FILES = 64
 SYNC_TARGETED_VERIFY_TIMEOUT_SEC = 8.0
 SYNC_CLEAR_ALL_TIMEOUT_SEC = 60.0
 WORKSPACE_IMPORT_FILE_CHUNK_BYTES = 128
+WORKSPACE_READ_FILE_CHUNK_BYTES = 48
 WORKSPACE_READ_TEXT_CHUNK_CHARS = 256
 WORKSPACE_IMPORT_FILE_TIMEOUT_MAX_SEC = 90.0
 WORKSPACE_IMPORT_FILE_THROUGHPUT_BYTES_PER_SEC = 4096.0
@@ -128,7 +130,13 @@ COMMAND_PRIORITY = {
     "sync-folder": 11,
     "clear-all-files": 11,
     "workspace.scan-tree": 11,
+    "workspace.list-directory": 11,
+    "workspace.stat": 11,
     "workspace.read-file": 11,
+    "workspace.write-file": 11,
+    "workspace.create-directory": 11,
+    "workspace.delete": 11,
+    "workspace.rename": 11,
     "workspace.import": 11,
     "hybrid.start": 11,
     "hybrid.stop": 12,
@@ -152,6 +160,12 @@ HELPER_FRAME_SUFFIX = "}}"
 
 class ControllerError(RuntimeError):
     pass
+
+
+class WorkspaceOperationError(ControllerError):
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class RunCancelledError(ControllerError):
@@ -1129,7 +1143,7 @@ class CalSciController:
     ) -> bytes:
         stream_code = _device_read_file_hex_stream_script(
             remote_path,
-            chunk_bytes=WORKSPACE_IMPORT_FILE_CHUNK_BYTES,
+            chunk_bytes=WORKSPACE_READ_FILE_CHUNK_BYTES,
         )
         raw = ""
         last_error: Exception | None = None
@@ -1192,6 +1206,70 @@ class CalSciController:
 
         return _parse_device_text_file_output(raw, remote_path=remote_path)
 
+    def sync_stat_path(
+        self,
+        remote_path: str,
+        timeout: float = SYNC_DIR_COMMAND_TIMEOUT_SEC,
+    ) -> dict[str, Any]:
+        stream_code = _device_stat_path_script(remote_path)
+        raw = ""
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_stat_output(friendly_raw, remote_path=remote_path)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly stat failed for {remote_path}: {friendly_exc}"
+                ) from friendly_exc
+
+        return _parse_device_stat_output(raw, remote_path=remote_path)
+
+    def sync_list_directory(
+        self,
+        remote_path: str,
+        timeout: float = SYNC_DIR_COMMAND_TIMEOUT_SEC,
+    ) -> list[dict[str, Any]]:
+        stream_code = _device_list_directory_stream_script(remote_path)
+        raw = ""
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_list_directory_output(friendly_raw)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly directory listing failed for {remote_path}: {friendly_exc}"
+                ) from friendly_exc
+
+        return _parse_device_list_directory_output(raw)
+
     def sync_mkdir(self, path: str) -> bool:
         target = json.dumps(path)
         code = (
@@ -1209,6 +1287,17 @@ class CalSciController:
         result = self.sync_exec_raw_and_read(code, timeout=1.0)
         return "EXISTS" in result
 
+    def sync_mkdir_recursive(self, path: str, timeout: float = SYNC_DIR_COMMAND_TIMEOUT_SEC) -> bool:
+        code = _device_mkdir_script(path)
+        result = self.sync_exec_raw_and_read(code, timeout=timeout)
+        if "Traceback" in result:
+            raise ControllerError(result.strip())
+        try:
+            stat = self.sync_stat_path(path, timeout=timeout)
+        except Exception:
+            return False
+        return stat.get("kind") == "directory"
+
     def sync_delete_file(self, path: str) -> bool:
         target = json.dumps(path)
         code = (
@@ -1221,6 +1310,73 @@ class CalSciController:
         )
         result = self.sync_exec_raw_and_read(code, timeout=3.0)
         return "DELETED" in result
+
+    def sync_delete_path(
+        self,
+        remote_path: str,
+        recursive: bool,
+        timeout: float = SYNC_DIR_COMMAND_TIMEOUT_SEC,
+    ) -> str:
+        stream_code = _device_delete_path_script(remote_path, recursive=recursive)
+        raw = ""
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                return _parse_device_delete_path_output(friendly_raw, remote_path=remote_path)
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly delete failed for {remote_path}: {friendly_exc}"
+                ) from friendly_exc
+
+        return _parse_device_delete_path_output(raw, remote_path=remote_path)
+
+    def sync_rename_path(
+        self,
+        old_path: str,
+        new_path: str,
+        timeout: float = SYNC_DIR_COMMAND_TIMEOUT_SEC,
+    ) -> None:
+        stream_code = _device_rename_path_script(old_path, new_path)
+        raw = ""
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                raw = self.sync_exec_raw_and_read(stream_code, timeout=timeout)
+                last_error = None
+                break
+            except ControllerError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self.sync_enter_friendly_repl()
+                    continue
+                break
+
+        if last_error is not None:
+            try:
+                friendly_raw = self.sync_exec_friendly_and_read(stream_code, timeout=timeout)
+                _parse_device_rename_path_output(friendly_raw, old_path=old_path, new_path=new_path)
+                return
+            except Exception as friendly_exc:
+                raise ControllerError(
+                    f"{last_error} | friendly rename failed for {old_path} -> {new_path}: {friendly_exc}"
+                ) from friendly_exc
+
+        _parse_device_rename_path_output(raw, old_path=old_path, new_path=new_path)
 
     def sync_clear_all(self, timeout: float = SYNC_CLEAR_ALL_TIMEOUT_SEC) -> str:
         return self.sync_exec_raw_and_read(_device_clear_all_script(), timeout=timeout)
@@ -1929,8 +2085,8 @@ class PersistentSession:
                             report(f"[{index}/{len(to_delete)}] Failed: {remote_path} ({exc})")
 
                 directory_failures: list[str] = []
+                required_dirs = directories
                 if to_upload:
-                    required_dirs = _build_sync_directory_plan(remote_root, to_upload)
                     device_dirs = [
                         device_dir
                         for device_dir in (_sync_device_relative_path(remote_dir) for remote_dir in required_dirs)
@@ -2012,11 +2168,31 @@ class PersistentSession:
                         if raw_upload_open:
                             controller.sync_exit_raw_repl()
                 else:
-                    required_dirs = []
                     synced_bytes = 0
                     uploaded_count = 0
                     upload_failures = []
-                    if not to_delete:
+                    if required_dirs:
+                        device_dirs = [
+                            device_dir
+                            for device_dir in (_sync_device_relative_path(remote_dir) for remote_dir in required_dirs)
+                            if device_dir
+                        ]
+                        report("Creating folder structure…")
+                        for device_dir in device_dirs:
+                            self._raise_if_abort_requested()
+                            try:
+                                if controller.sync_mkdir(device_dir):
+                                    report(f"  + {device_dir}")
+                                else:
+                                    directory_failures.append(device_dir)
+                                    report(f"  ! {device_dir} (failed)")
+                            except Exception as exc:
+                                if _should_abort_for_exception(exc):
+                                    raise
+                                directory_failures.append(device_dir)
+                                report(f"  ! {device_dir} ({exc})")
+                        report("Folder structure synced ✓")
+                    if not to_delete and not required_dirs:
                         report("Everything is already in sync")
 
                 directory_warning_count = 0
@@ -2299,6 +2475,151 @@ class PersistentSession:
 
         return payload
 
+    def workspace_list_directory(self, port: str | None, remote_path: str) -> dict[str, Any]:
+        normalized_remote_path = _sync_device_absolute_path(remote_path)
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "remotePath": normalized_remote_path,
+                    "entries": [],
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "remotePath": normalized_remote_path,
+                    "entries": [],
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                entries = controller.sync_list_directory(
+                    normalized_remote_path,
+                    timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC,
+                )
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "entries": entries,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "entries": [],
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after directory listing"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def workspace_stat(self, port: str | None, remote_path: str) -> dict[str, Any]:
+        normalized_remote_path = _sync_device_absolute_path(remote_path)
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "remotePath": normalized_remote_path,
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                stat = controller.sync_stat_path(
+                    normalized_remote_path,
+                    timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC,
+                )
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "stat": stat,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after stat"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
     def workspace_read_file(self, port: str | None, remote_path: str) -> dict[str, Any]:
         normalized_remote_path = _sync_device_absolute_path(remote_path)
         if port:
@@ -2325,7 +2646,14 @@ class PersistentSession:
             payload: dict[str, Any]
             recovery_payload: dict[str, Any] | None = None
             try:
-                content_text = controller.sync_read_file_text(
+                stat = controller.sync_stat_path(
+                    normalized_remote_path,
+                    timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC,
+                )
+                if stat.get("kind") != "file":
+                    raise WorkspaceOperationError(f"Path is a directory: {normalized_remote_path}", code="EISDIR")
+
+                content_bytes = controller.sync_read_file_bytes(
                     normalized_remote_path,
                     timeout=SYNC_SCAN_COMMAND_TIMEOUT_SEC,
                 )
@@ -2333,13 +2661,15 @@ class PersistentSession:
                     "ok": True,
                     "port": controller.port,
                     "remotePath": normalized_remote_path,
-                    "content": content_text,
+                    "size": len(content_bytes),
+                    "contentBase64": base64.b64encode(content_bytes).decode("ascii"),
                 }
             except Exception as exc:
                 payload = {
                     "ok": False,
                     "port": controller.port,
                     "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
                     "error": str(exc),
                 }
                 if not _should_abort_for_exception(exc):
@@ -2354,6 +2684,394 @@ class PersistentSession:
             payload["ok"] = False
             existing_error = payload.get("error")
             restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after file read"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def workspace_write_file(
+        self,
+        port: str | None,
+        remote_path: str,
+        content_base64: str,
+        create: bool,
+        overwrite: bool,
+    ) -> dict[str, Any]:
+        normalized_remote_path = _sync_device_absolute_path(remote_path)
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "remotePath": normalized_remote_path,
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        try:
+            content_bytes = base64.b64decode(content_base64.encode("ascii"), validate=True)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "port": port or "",
+                "remotePath": normalized_remote_path,
+                "code": "EINVAL",
+                "error": f"Invalid file content encoding: {exc}",
+            }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                if normalized_remote_path == "/":
+                    raise WorkspaceOperationError("Cannot write to the device root.", code="EISDIR")
+
+                parent_path = posixpath.dirname(normalized_remote_path) or "/"
+                parent_stat = controller.sync_stat_path(parent_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                if parent_stat.get("kind") != "directory":
+                    raise WorkspaceOperationError(f"Parent path is not a directory: {parent_path}", code="ENOTDIR")
+
+                existing_stat: dict[str, Any] | None = None
+                try:
+                    existing_stat = controller.sync_stat_path(normalized_remote_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                except WorkspaceOperationError as exc:
+                    if exc.code != "ENOENT":
+                        raise
+
+                if existing_stat is None and not create:
+                    raise WorkspaceOperationError(f"File not found: {normalized_remote_path}", code="ENOENT")
+                if existing_stat is not None:
+                    if existing_stat.get("kind") != "file":
+                        raise WorkspaceOperationError(f"Path is a directory: {normalized_remote_path}", code="EISDIR")
+                    if not overwrite:
+                        raise WorkspaceOperationError(f"File already exists: {normalized_remote_path}", code="EEXIST")
+
+                controller.sync_put_content(normalized_remote_path, content_bytes)
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "size": len(content_bytes),
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after file write"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def workspace_create_directory(self, port: str | None, remote_path: str) -> dict[str, Any]:
+        normalized_remote_path = _sync_device_absolute_path(remote_path)
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "remotePath": normalized_remote_path,
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                if normalized_remote_path == "/":
+                    raise WorkspaceOperationError("The device root already exists.", code="EEXIST")
+
+                parent_path = posixpath.dirname(normalized_remote_path) or "/"
+                parent_stat = controller.sync_stat_path(parent_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                if parent_stat.get("kind") != "directory":
+                    raise WorkspaceOperationError(f"Parent path is not a directory: {parent_path}", code="ENOTDIR")
+
+                try:
+                    existing_stat = controller.sync_stat_path(normalized_remote_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                except WorkspaceOperationError as exc:
+                    if exc.code != "ENOENT":
+                        raise
+                else:
+                    raise WorkspaceOperationError(
+                        f"Path already exists: {normalized_remote_path}",
+                        code="EEXIST" if existing_stat.get("kind") == "directory" else "EEXIST",
+                    )
+
+                created = controller.sync_mkdir_recursive(normalized_remote_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                if not created:
+                    raise WorkspaceOperationError(f"Directory was not created: {normalized_remote_path}", code="EINVAL")
+
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after mkdir"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def workspace_delete(self, port: str | None, remote_path: str, recursive: bool) -> dict[str, Any]:
+        normalized_remote_path = _sync_device_absolute_path(remote_path)
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "remotePath": normalized_remote_path,
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                if normalized_remote_path == "/":
+                    raise WorkspaceOperationError("Cannot delete the device root.", code="EPERM")
+
+                stat = controller.sync_stat_path(normalized_remote_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                deleted_kind = controller.sync_delete_path(
+                    normalized_remote_path,
+                    recursive=recursive or stat.get("kind") == "file",
+                    timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC,
+                )
+                payload = {
+                    "ok": True,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "kind": deleted_kind,
+                }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "remotePath": normalized_remote_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after delete"
+            if existing_error:
+                payload["error"] = f"{existing_error} | restore failed: {restore_error}"
+            else:
+                payload["error"] = f"restore failed: {restore_error}"
+
+        if recovery_payload is not None:
+            payload["restoreDetail"] = {
+                "ok": bool(recovery_payload.get("ok")),
+                "port": payload.get("port", port or ""),
+                "recovery": recovery_payload,
+            }
+
+        return payload
+
+    def workspace_rename(
+        self,
+        port: str | None,
+        old_path: str,
+        new_path: str,
+        overwrite: bool,
+    ) -> dict[str, Any]:
+        normalized_old_path = _sync_device_absolute_path(old_path)
+        normalized_new_path = _sync_device_absolute_path(new_path)
+        if port:
+            opened = self.open(port)
+            if not opened.get("ok"):
+                return {
+                    "ok": False,
+                    "port": port,
+                    "oldPath": normalized_old_path,
+                    "newPath": normalized_new_path,
+                    "error": opened.get("error", "Failed to open session."),
+                }
+
+        with self._operation_lock:
+            try:
+                controller, pause_requested = self._begin_exclusive_operation()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "port": port or "",
+                    "oldPath": normalized_old_path,
+                    "newPath": normalized_new_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+
+            payload: dict[str, Any]
+            recovery_payload: dict[str, Any] | None = None
+            try:
+                if normalized_old_path == normalized_new_path:
+                    payload = {
+                        "ok": True,
+                        "port": controller.port,
+                        "oldPath": normalized_old_path,
+                        "newPath": normalized_new_path,
+                    }
+                else:
+                    if normalized_old_path == "/" or normalized_new_path == "/":
+                        raise WorkspaceOperationError("Cannot rename the device root.", code="EINVAL")
+
+                    controller.sync_stat_path(normalized_old_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+
+                    target_parent = posixpath.dirname(normalized_new_path) or "/"
+                    parent_stat = controller.sync_stat_path(target_parent, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                    if parent_stat.get("kind") != "directory":
+                        raise WorkspaceOperationError(f"Parent path is not a directory: {target_parent}", code="ENOTDIR")
+
+                    try:
+                        target_stat = controller.sync_stat_path(normalized_new_path, timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC)
+                    except WorkspaceOperationError as exc:
+                        if exc.code != "ENOENT":
+                            raise
+                    else:
+                        if not overwrite:
+                            raise WorkspaceOperationError(f"Path already exists: {normalized_new_path}", code="EEXIST")
+                        controller.sync_delete_path(
+                            normalized_new_path,
+                            recursive=target_stat.get("kind") == "directory",
+                            timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC,
+                        )
+
+                    controller.sync_rename_path(
+                        normalized_old_path,
+                        normalized_new_path,
+                        timeout=SYNC_DIR_COMMAND_TIMEOUT_SEC,
+                    )
+                    payload = {
+                        "ok": True,
+                        "port": controller.port,
+                        "oldPath": normalized_old_path,
+                        "newPath": normalized_new_path,
+                    }
+            except Exception as exc:
+                payload = {
+                    "ok": False,
+                    "port": controller.port,
+                    "oldPath": normalized_old_path,
+                    "newPath": normalized_new_path,
+                    "code": _workspace_exception_code(exc),
+                    "error": str(exc),
+                }
+                if not _should_abort_for_exception(exc):
+                    recovery_payload = _recover_after_run_failure(controller)
+            finally:
+                self._end_exclusive_operation(pause_requested)
+
+        if recovery_payload and recovery_payload.get("output"):
+            self._emit_terminal_text(str(recovery_payload["output"]))
+
+        if recovery_payload and not recovery_payload.get("ok"):
+            payload["ok"] = False
+            existing_error = payload.get("error")
+            restore_error = recovery_payload.get("error") or "Failed to recover friendly REPL after rename"
             if existing_error:
                 payload["error"] = f"{existing_error} | restore failed: {restore_error}"
             else:
@@ -3521,10 +4239,46 @@ class JobDispatcher:
                 return self._session.workspace_scan_tree(
                     port=_optional_arg_string(args, "port"),
                 )
+            if job.command == "workspace.list-directory":
+                return self._session.workspace_list_directory(
+                    port=_optional_arg_string(args, "port"),
+                    remote_path=str(args["remotePath"]),
+                )
+            if job.command == "workspace.stat":
+                return self._session.workspace_stat(
+                    port=_optional_arg_string(args, "port"),
+                    remote_path=str(args["remotePath"]),
+                )
             if job.command == "workspace.read-file":
                 return self._session.workspace_read_file(
                     port=_optional_arg_string(args, "port"),
                     remote_path=str(args["remotePath"]),
+                )
+            if job.command == "workspace.write-file":
+                return self._session.workspace_write_file(
+                    port=_optional_arg_string(args, "port"),
+                    remote_path=str(args["remotePath"]),
+                    content_base64=str(args["contentBase64"]),
+                    create=bool(args.get("create", False)),
+                    overwrite=bool(args.get("overwrite", False)),
+                )
+            if job.command == "workspace.create-directory":
+                return self._session.workspace_create_directory(
+                    port=_optional_arg_string(args, "port"),
+                    remote_path=str(args["remotePath"]),
+                )
+            if job.command == "workspace.delete":
+                return self._session.workspace_delete(
+                    port=_optional_arg_string(args, "port"),
+                    remote_path=str(args["remotePath"]),
+                    recursive=bool(args.get("recursive", False)),
+                )
+            if job.command == "workspace.rename":
+                return self._session.workspace_rename(
+                    port=_optional_arg_string(args, "port"),
+                    old_path=str(args["oldPath"]),
+                    new_path=str(args["newPath"]),
+                    overwrite=bool(args.get("overwrite", False)),
                 )
             if job.command == "workspace.import":
                 return self._session.import_workspace(
@@ -4406,6 +5160,22 @@ def _device_read_text_file_stream_script(remote_file: str, chunk_chars: int) -> 
     return _sync_scripts.device_read_text_file_stream_script(remote_file, chunk_chars=chunk_chars)
 
 
+def _device_stat_path_script(remote_path: str) -> str:
+    return _sync_scripts.device_stat_path_script(remote_path)
+
+
+def _device_list_directory_stream_script(remote_dir: str) -> str:
+    return _sync_scripts.device_list_directory_stream_script(remote_dir)
+
+
+def _device_delete_path_script(remote_path: str, recursive: bool) -> str:
+    return _sync_scripts.device_delete_path_script(remote_path, recursive=recursive)
+
+
+def _device_rename_path_script(old_path: str, new_path: str) -> str:
+    return _sync_scripts.device_rename_path_script(old_path, new_path)
+
+
 def _device_put_file_script(remote_file: str, data: bytes) -> str:
     return _sync_scripts.device_put_file_script(remote_file, data, chunk_bytes=SYNC_FILE_SCRIPT_CHUNK_BYTES)
 
@@ -4750,6 +5520,185 @@ def _parse_device_tree_stream_output(output: str) -> tuple[list[str], dict[str, 
     if not snippet:
         raise ControllerError("Device tree scan returned no output.")
     raise ControllerError(f"Device tree scan produced no DIR/FILE rows: {snippet[:200]}")
+
+
+def _workspace_errno_to_code(errno_value: str | int | None) -> str | None:
+    if errno_value is None:
+        return None
+
+    try:
+        numeric = int(errno_value)
+    except Exception:
+        return None
+
+    return {
+        1: "EPERM",
+        2: "ENOENT",
+        17: "EEXIST",
+        20: "ENOTDIR",
+        21: "EISDIR",
+        22: "EINVAL",
+        28: "ENOSPC",
+        39: "ENOTEMPTY",
+    }.get(numeric)
+
+
+def _parse_workspace_error_payload(payload: str) -> WorkspaceOperationError:
+    errno_text, separator, message = payload.partition(":")
+    code = _workspace_errno_to_code(errno_text.strip() if separator else None)
+    detail = message.strip() if separator else payload.strip()
+    if not detail:
+        detail = "CalSci workspace operation failed."
+    return WorkspaceOperationError(detail, code=code)
+
+
+def _workspace_exception_code(exc: Exception) -> str | None:
+    code = getattr(exc, "code", None)
+    return str(code) if isinstance(code, str) and code else None
+
+
+def _parse_device_stat_output(output: str, *, remote_path: str) -> dict[str, Any]:
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("STATERR:"):
+            raise _parse_workspace_error_payload(line[len("STATERR:") :])
+        if not line.startswith("STAT:"):
+            continue
+
+        fields = line[len("STAT:") :].split(":", 3)
+        if len(fields) != 4:
+            continue
+        kind_code, size_text, mtime_text, ctime_text = fields
+        kind = "directory" if kind_code == "D" else "file"
+
+        try:
+            size = int(size_text)
+        except Exception:
+            size = 0
+        try:
+            mtime = int(mtime_text)
+        except Exception:
+            mtime = 0
+        try:
+            ctime = int(ctime_text)
+        except Exception:
+            ctime = mtime
+
+        return {
+            "path": remote_path,
+            "kind": kind,
+            "size": size,
+            "mtime": mtime,
+            "ctime": ctime,
+        }
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError(f"Device stat returned no output for {remote_path}.")
+    raise ControllerError(f"Device stat produced no STAT row for {remote_path}: {snippet[:200]}")
+
+
+def _parse_device_list_directory_output(output: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    done_seen = False
+
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "LIST_DONE":
+            done_seen = True
+            continue
+        if line.startswith("LISTERR:"):
+            raise _parse_workspace_error_payload(line[len("LISTERR:") :])
+        if not line.startswith("ENTRY:"):
+            continue
+
+        payload = line[len("ENTRY:") :]
+        length_sep = payload.find(":")
+        if length_sep <= 0:
+            continue
+        try:
+            path_length = int(payload[:length_sep])
+        except Exception:
+            continue
+
+        remainder = payload[length_sep + 1 :]
+        if path_length < 0 or len(remainder) < path_length + 3:
+            continue
+
+        remote_path = remainder[:path_length]
+        if len(remainder) <= path_length or remainder[path_length] != ":":
+            continue
+
+        fields = remainder[path_length + 1 :].split(":", 2)
+        if len(fields) != 3:
+            continue
+        kind_code, size_text, mtime_text = fields
+
+        try:
+            size = int(size_text)
+        except Exception:
+            size = 0
+        try:
+            mtime = int(mtime_text)
+        except Exception:
+            mtime = 0
+
+        entries.append(
+            {
+                "name": posixpath.basename(remote_path),
+                "path": remote_path,
+                "kind": "directory" if kind_code == "D" else "file",
+                "size": size,
+                "mtime": mtime,
+                "ctime": mtime,
+            }
+        )
+
+    if entries or done_seen:
+        return sorted(entries, key=lambda entry: (entry["kind"] != "directory", entry["name"].lower()))
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError("Device directory listing returned no output.")
+    raise ControllerError(f"Device directory listing produced no ENTRY rows: {snippet[:200]}")
+
+
+def _parse_device_delete_path_output(output: str, *, remote_path: str) -> str:
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("DELERR:"):
+            raise _parse_workspace_error_payload(line[len("DELERR:") :])
+        if line == "DELOK:D":
+            return "directory"
+        if line == "DELOK:F":
+            return "file"
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError(f"Device delete returned no output for {remote_path}.")
+    raise ControllerError(f"Device delete produced no DELOK row for {remote_path}: {snippet[:200]}")
+
+
+def _parse_device_rename_path_output(output: str, *, old_path: str, new_path: str) -> None:
+    for raw_line in output.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("RENAMEERR:"):
+            raise _parse_workspace_error_payload(line[len("RENAMEERR:") :])
+        if line == "RENAME_OK":
+            return
+
+    snippet = output.strip()
+    if not snippet:
+        raise ControllerError(f"Device rename returned no output for {old_path} -> {new_path}.")
+    raise ControllerError(f"Device rename produced no confirmation for {old_path} -> {new_path}: {snippet[:200]}")
 
 
 def _parse_device_file_hex_output(output: str, *, remote_path: str) -> bytes:

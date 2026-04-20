@@ -3,7 +3,7 @@ export const SYNC_FOLDER_HISTORY_KEY = "syncFolderHistory";
 export const POLL_INTERVAL_MS = 1000;
 export const BACKEND_TIMEOUT_BUFFER_SEC = 30;
 export const SESSION_RETRY_BACKOFF_MS = 3000;
-export const MAX_SYNC_FOLDER_HISTORY = 10;
+export const MAX_SYNC_FOLDER_HISTORY = 2;
 
 export type DeviceInfo = {
   port: string;
@@ -76,16 +76,64 @@ export type WorkspaceImportResult = {
   error?: string;
 };
 
+export type WorkspaceErrorCode =
+  | "ENOENT"
+  | "EEXIST"
+  | "ENOTDIR"
+  | "EISDIR"
+  | "ENOTEMPTY"
+  | "ENOSPC"
+  | "EPERM"
+  | "EINVAL";
+
+export type WorkspaceEntryKind = "directory" | "file";
+
 export type WorkspaceTreeEntry = {
   path: string;
-  kind: "directory" | "file";
+  kind: WorkspaceEntryKind;
   size?: number;
+};
+
+export type WorkspaceDirectoryEntry = {
+  name: string;
+  path: string;
+  kind: WorkspaceEntryKind;
+  size?: number;
+  ctime?: number;
+  mtime?: number;
+};
+
+export type WorkspaceStat = {
+  path: string;
+  kind: WorkspaceEntryKind;
+  size: number;
+  ctime?: number;
+  mtime?: number;
 };
 
 export type WorkspaceTreeResult = {
   ok: boolean;
   port: string;
   entries?: WorkspaceTreeEntry[];
+  code?: WorkspaceErrorCode;
+  error?: string;
+};
+
+export type WorkspaceDirectoryResult = {
+  ok: boolean;
+  port: string;
+  remotePath: string;
+  entries?: WorkspaceDirectoryEntry[];
+  code?: WorkspaceErrorCode;
+  error?: string;
+};
+
+export type WorkspaceStatResult = {
+  ok: boolean;
+  port: string;
+  remotePath: string;
+  stat?: WorkspaceStat;
+  code?: WorkspaceErrorCode;
   error?: string;
 };
 
@@ -93,7 +141,44 @@ export type WorkspaceFileResult = {
   ok: boolean;
   port: string;
   remotePath: string;
-  content?: string;
+  contentBase64?: string;
+  size?: number;
+  code?: WorkspaceErrorCode;
+  error?: string;
+};
+
+export type WorkspaceWriteFileResult = {
+  ok: boolean;
+  port: string;
+  remotePath: string;
+  size?: number;
+  code?: WorkspaceErrorCode;
+  error?: string;
+};
+
+export type WorkspaceCreateDirectoryResult = {
+  ok: boolean;
+  port: string;
+  remotePath: string;
+  code?: WorkspaceErrorCode;
+  error?: string;
+};
+
+export type WorkspaceDeleteResult = {
+  ok: boolean;
+  port: string;
+  remotePath: string;
+  kind?: WorkspaceEntryKind;
+  code?: WorkspaceErrorCode;
+  error?: string;
+};
+
+export type WorkspaceRenameResult = {
+  ok: boolean;
+  port: string;
+  oldPath: string;
+  newPath: string;
+  code?: WorkspaceErrorCode;
   error?: string;
 };
 

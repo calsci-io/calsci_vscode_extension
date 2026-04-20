@@ -2,7 +2,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 
 import { type WorkspaceTreeEntry } from "../core/shared";
-import { createCalSciWorkspaceUri } from "./workspaceContentProvider";
+import { createCalSciWorkspaceUri } from "./workspaceFileSystemProvider";
 
 type WorkspaceNodeKind = "folder" | "file";
 
@@ -21,20 +21,56 @@ type WorkspaceNode = {
   name: string;
   remotePath: string;
   size?: number;
+  checked: boolean;
+  parent?: WorkspaceNode;
   children: WorkspaceNode[];
 };
 
-class CalSciWorkspaceItem extends vscode.TreeItem {
+function setSubtreeChecked(node: WorkspaceNode, checked: boolean): void {
+  node.checked = checked;
+  for (const child of node.children) {
+    setSubtreeChecked(child, checked);
+  }
+}
+
+function syncAncestorSelection(node: WorkspaceNode | undefined): void {
+  let current = node;
+  while (current) {
+    current.checked = current.children.length > 0 && current.children.every((child) => child.checked);
+    current = current.parent;
+  }
+}
+
+function collectSelectedPaths(nodes: readonly WorkspaceNode[]): string[] {
+  const selectedPaths: string[] = [];
+
+  for (const node of nodes) {
+    if (node.checked) {
+      selectedPaths.push(node.remotePath);
+      continue;
+    }
+
+    if (node.children.length > 0) {
+      selectedPaths.push(...collectSelectedPaths(node.children));
+    }
+  }
+
+  return selectedPaths;
+}
+
+export class CalSciWorkspaceItem extends vscode.TreeItem {
   constructor(
     public readonly kind: "placeholder" | WorkspaceNodeKind,
     label: string,
     public readonly remotePath?: string,
     public readonly port?: string,
     collapsibleState?: vscode.TreeItemCollapsibleState,
+    checkboxState?: vscode.TreeItemCheckboxState,
   ) {
     super(label, collapsibleState ?? vscode.TreeItemCollapsibleState.None);
 
     if (kind === "placeholder") {
+      this.id = `placeholder:${label}`;
       this.command = {
         command: "calsci.refreshWorkspace",
         title: "Refresh CalSci Workspace",
@@ -44,12 +80,18 @@ class CalSciWorkspaceItem extends vscode.TreeItem {
       return;
     }
 
+    if (checkboxState !== undefined) {
+      this.checkboxState = checkboxState;
+    }
+
     if (!remotePath || !port) {
       return;
     }
 
+    this.id = `${port}:${remotePath}`;
+
     if (kind === "folder") {
-      this.contextValue = "calsciWorkspaceFolder";
+      this.contextValue = remotePath === "/" ? "calsciWorkspaceRoot" : "calsciWorkspaceFolder";
       this.iconPath = vscode.ThemeIcon.Folder;
       return;
     }
@@ -58,19 +100,21 @@ class CalSciWorkspaceItem extends vscode.TreeItem {
     this.resourceUri = resourceUri;
     this.contextValue = "calsciWorkspaceFile";
     this.command = {
-      command: "calsci.openWorkspaceFile",
+      command: "vscode.open",
       title: "Open CalSci File",
-      arguments: [remotePath, port],
+      arguments: [resourceUri],
     };
   }
 }
 
 export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalSciWorkspaceItem> {
   private readonly changeEmitter = new vscode.EventEmitter<CalSciWorkspaceItem | undefined | void>();
+  private readonly fetchStateEmitter = new vscode.EventEmitter<void>();
   private readonly root: WorkspaceNode = {
     kind: "folder",
     name: "CalSci",
     remotePath: "/",
+    checked: false,
     children: [],
   };
 
@@ -79,27 +123,147 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
   private errorMessage: string | undefined;
   private loadPromise: Promise<void> | undefined;
   private manualLoadRequested = false;
+  private refreshQueued = false;
+  private fetchSelectionActive = false;
 
   public readonly onDidChangeTreeData = this.changeEmitter.event;
+  public readonly onDidChangeFetchState = this.fetchStateEmitter.event;
+
+  public get isFetchSelectionActive(): boolean {
+    return this.fetchSelectionActive;
+  }
+
+  public get fetchSelectionPort(): string | undefined {
+    return this.fetchSelectionActive ? this.loadedPort : undefined;
+  }
 
   constructor(private readonly handlers: WorkspaceViewHandlers) {}
 
-  public invalidate(): void {
+  public activateFetchSelection(port: string): boolean {
+    if (this.scanState !== "ready" || this.loadedPort !== port || this.root.children.length === 0) {
+      return false;
+    }
+
+    setSubtreeChecked(this.root, false);
+    this.fetchSelectionActive = true;
+    this.changeEmitter.fire();
+    this.fetchStateEmitter.fire();
+    return true;
+  }
+
+  public setFetchSelectionSnapshot(port: string, entries: WorkspaceTreeEntry[]): void {
+    this.loadedPort = port;
+    this.errorMessage = undefined;
+    this.scanState = "ready";
+    this.loadPromise = undefined;
+    this.refreshQueued = false;
+    this.manualLoadRequested = true;
+    this.root.checked = false;
+    this.root.children = this.buildTree(entries, this.root);
+    this.fetchSelectionActive = true;
+    this.changeEmitter.fire();
+    this.fetchStateEmitter.fire();
+  }
+
+  public clearFetchSelection(): void {
+    if (!this.fetchSelectionActive) {
+      return;
+    }
+
+    setSubtreeChecked(this.root, false);
+    this.changeEmitter.fire();
+    this.fetchStateEmitter.fire();
+  }
+
+  public resetFetchSelection(): void {
+    if (!this.fetchSelectionActive && this.getSelectedFetchPaths().length === 0) {
+      return;
+    }
+
+    setSubtreeChecked(this.root, false);
+    this.fetchSelectionActive = false;
+    this.changeEmitter.fire();
+    this.fetchStateEmitter.fire();
+  }
+
+  public getSelectedFetchPaths(): string[] {
+    if (!this.fetchSelectionActive || this.root.children.length === 0) {
+      return [];
+    }
+
+    return collectSelectedPaths([this.root]);
+  }
+
+  public handleCheckboxStateChange(
+    items: ReadonlyArray<readonly [CalSciWorkspaceItem, vscode.TreeItemCheckboxState]>,
+  ): boolean {
+    if (!this.fetchSelectionActive || items.length === 0) {
+      return false;
+    }
+
+    let changed = false;
+    for (const [item, checkboxState] of items) {
+      if (item.kind === "placeholder") {
+        continue;
+      }
+
+      const node = this.findNode(item.remotePath ?? "/");
+      if (!node) {
+        continue;
+      }
+
+      const checked = checkboxState === vscode.TreeItemCheckboxState.Checked;
+      setSubtreeChecked(node, checked);
+      syncAncestorSelection(node.parent);
+      changed = true;
+    }
+
+    if (!changed) {
+      return false;
+    }
+
+    this.changeEmitter.fire();
+    this.fetchStateEmitter.fire();
+    return true;
+  }
+
+  public invalidate(preserveLoadedState = false): void {
+    if (preserveLoadedState && this.scanState === "ready" && this.loadedPort) {
+      this.manualLoadRequested = true;
+      void this.refreshPreservingView();
+      return;
+    }
+
+    const shouldPreserveLoad = preserveLoadedState && this.manualLoadRequested;
+    const fetchStateChanged = this.fetchSelectionActive;
     this.scanState = "idle";
     this.loadedPort = undefined;
     this.errorMessage = undefined;
     this.loadPromise = undefined;
-    this.manualLoadRequested = false;
+    this.refreshQueued = false;
+    this.manualLoadRequested = shouldPreserveLoad;
+    this.fetchSelectionActive = false;
+    this.root.checked = false;
     this.root.children = [];
     this.changeEmitter.fire();
+    if (fetchStateChanged) {
+      this.fetchStateEmitter.fire();
+    }
   }
 
   public async reload(): Promise<void> {
+    this.manualLoadRequested = true;
+    if (this.scanState === "ready" && this.loadedPort) {
+      await this.refreshPreservingView();
+      return;
+    }
+
     this.scanState = "idle";
     this.loadedPort = undefined;
     this.errorMessage = undefined;
     this.loadPromise = undefined;
-    this.manualLoadRequested = true;
+    this.refreshQueued = false;
+    this.root.checked = false;
     this.root.children = [];
     await this.ensureLoaded();
     this.changeEmitter.fire();
@@ -135,15 +299,7 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
     }
 
     if (!element) {
-      return [
-        new CalSciWorkspaceItem(
-          "folder",
-          "CalSci",
-          "/",
-          this.loadedPort,
-          vscode.TreeItemCollapsibleState.Expanded,
-        ),
-      ];
+      return [this.toTreeItem(this.root)];
     }
 
     if (element.kind === "placeholder") {
@@ -174,30 +330,67 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
     this.scanState = "loading";
     this.changeEmitter.fire();
 
-    this.loadPromise = (async () => {
-      try {
-        const snapshot = await this.handlers.scanTree();
-        this.loadedPort = snapshot.port;
-        this.errorMessage = undefined;
-        this.root.children = this.buildTree(snapshot.entries);
-        this.scanState = "ready";
-      } catch (error) {
-        this.loadedPort = undefined;
-        this.root.children = [];
-        this.errorMessage = error instanceof Error ? error.message : String(error);
-        this.scanState = "error";
-      } finally {
-        this.loadPromise = undefined;
-        this.changeEmitter.fire();
-      }
-    })();
+    this.loadPromise = this.loadSnapshot(false);
 
     await this.loadPromise;
   }
 
-  private buildTree(entries: WorkspaceTreeEntry[]): WorkspaceNode[] {
+  private async refreshPreservingView(): Promise<void> {
+    if (this.loadPromise) {
+      this.refreshQueued = true;
+      await this.loadPromise;
+      return;
+    }
+
+    this.loadPromise = this.loadSnapshot(true);
+    await this.loadPromise;
+  }
+
+  private async loadSnapshot(preserveExisting: boolean): Promise<void> {
+    let fetchStateChanged = false;
+    try {
+      const snapshot = await this.handlers.scanTree();
+      this.loadedPort = snapshot.port;
+      this.errorMessage = undefined;
+      this.root.checked = false;
+      this.root.children = this.buildTree(snapshot.entries, this.root);
+      this.scanState = "ready";
+      if (this.fetchSelectionActive) {
+        fetchStateChanged = true;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.errorMessage = message;
+
+      if (!preserveExisting || !this.loadedPort) {
+        this.loadedPort = undefined;
+        this.root.checked = false;
+        this.root.children = [];
+        this.scanState = "error";
+        if (this.fetchSelectionActive) {
+          this.fetchSelectionActive = false;
+          fetchStateChanged = true;
+        }
+      }
+    } finally {
+      this.loadPromise = undefined;
+      this.changeEmitter.fire();
+      if (fetchStateChanged) {
+        this.fetchStateEmitter.fire();
+      }
+
+      if (this.refreshQueued) {
+        this.refreshQueued = false;
+        void this.refreshPreservingView();
+      }
+    }
+  }
+
+  private buildTree(entries: WorkspaceTreeEntry[], root: WorkspaceNode): WorkspaceNode[] {
+    root.checked = false;
+    root.children = [];
     const nodes = new Map<string, WorkspaceNode>();
-    nodes.set("/", this.root);
+    nodes.set("/", root);
 
     const ensureFolder = (remotePath: string): WorkspaceNode => {
       const normalizedPath = normalizeRemotePath(remotePath);
@@ -212,6 +405,8 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
         kind: "folder",
         name: normalizedPath === "/" ? "CalSci" : path.posix.basename(normalizedPath),
         remotePath: normalizedPath,
+        checked: false,
+        parent,
         children: [],
       };
       nodes.set(normalizedPath, node);
@@ -232,6 +427,8 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
         name: path.posix.basename(normalizedPath),
         remotePath: normalizedPath,
         size: entry.size,
+        checked: false,
+        parent,
         children: [],
       };
       nodes.set(normalizedPath, node);
@@ -252,8 +449,8 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
       }
     };
 
-    sortChildren(this.root);
-    return this.root.children;
+    sortChildren(root);
+    return root.children;
   }
 
   private findNode(remotePath: string): WorkspaceNode | undefined {
@@ -281,14 +478,18 @@ export class CalSciWorkspaceViewProvider implements vscode.TreeDataProvider<CalS
   }
 
   private toTreeItem(node: WorkspaceNode): CalSciWorkspaceItem {
+    const checkboxState = this.fetchSelectionActive
+      ? (node.checked ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked)
+      : undefined;
     const item = new CalSciWorkspaceItem(
       node.kind,
       node.name,
       node.remotePath,
       this.loadedPort,
       node.kind === "folder"
-        ? vscode.TreeItemCollapsibleState.Collapsed
+        ? (node.remotePath === "/" ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed)
         : vscode.TreeItemCollapsibleState.None,
+      checkboxState,
     );
 
     if (node.kind === "folder" && node.remotePath === "/" && this.loadedPort) {

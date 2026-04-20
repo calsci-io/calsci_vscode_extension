@@ -422,6 +422,185 @@ def device_read_text_file_stream_script(remote_file: str, chunk_chars: int) -> s
     )
 
 
+def device_stat_path_script(remote_path: str) -> str:
+    remote_path_json = json.dumps(remote_path)
+    return (
+        "import os\n"
+        f"_path = {remote_path_json}\n"
+        "def _emit_err(_prefix, _exc):\n"
+        "    _errno = getattr(_exc, 'errno', None)\n"
+        "    if _errno is None:\n"
+        "        try:\n"
+        "            _errno = int(_exc.args[0]) if getattr(_exc, 'args', None) else None\n"
+        "        except:\n"
+        "            _errno = None\n"
+        "    print(_prefix + ':' + ('' if _errno is None else str(_errno)) + ':' + str(_exc))\n"
+        "def _is_dir(_path, _stat):\n"
+        "    try:\n"
+        "        _mode = _stat[0] if _stat and len(_stat) > 0 else 0\n"
+        "        if _mode & 0x4000:\n"
+        "            return True\n"
+        "    except:\n"
+        "        pass\n"
+        "    try:\n"
+        "        os.ilistdir(_path)\n"
+        "        return True\n"
+        "    except:\n"
+        "        return False\n"
+        "try:\n"
+        "    _stat = os.stat(_path)\n"
+        "    _kind = 'D' if _is_dir(_path, _stat) else 'F'\n"
+        "    _size = 0 if _kind == 'D' else (_stat[6] if len(_stat) > 6 else 0)\n"
+        "    _mtime = _stat[8] if len(_stat) > 8 else 0\n"
+        "    _ctime = _stat[9] if len(_stat) > 9 else _mtime\n"
+        "    print('STAT:' + _kind + ':' + str(_size) + ':' + str(_mtime) + ':' + str(_ctime))\n"
+        "except Exception as _exc:\n"
+        "    _emit_err('STATERR', _exc)\n"
+    )
+
+
+def device_list_directory_stream_script(remote_dir: str) -> str:
+    remote_dir_json = json.dumps(remote_dir)
+    return (
+        "import os, sys\n"
+        f"_path = {remote_dir_json}\n"
+        "def _emit_err(_prefix, _exc):\n"
+        "    _errno = getattr(_exc, 'errno', None)\n"
+        "    if _errno is None:\n"
+        "        try:\n"
+        "            _errno = int(_exc.args[0]) if getattr(_exc, 'args', None) else None\n"
+        "        except:\n"
+        "            _errno = None\n"
+        "    print(_prefix + ':' + ('' if _errno is None else str(_errno)) + ':' + str(_exc))\n"
+        "def _is_dir(_entry, _full, _stat):\n"
+        "    try:\n"
+        "        if len(_entry) > 1 and isinstance(_entry[1], int) and (_entry[1] & 0x4000):\n"
+        "            return True\n"
+        "    except:\n"
+        "        pass\n"
+        "    try:\n"
+        "        _mode = _stat[0] if _stat and len(_stat) > 0 else 0\n"
+        "        if _mode & 0x4000:\n"
+        "            return True\n"
+        "    except:\n"
+        "        pass\n"
+        "    try:\n"
+        "        os.ilistdir(_full)\n"
+        "        return True\n"
+        "    except:\n"
+        "        return False\n"
+        "try:\n"
+        "    for _entry in os.ilistdir(_path):\n"
+        "        _name = _entry[0]\n"
+        "        _full = _path + '/' + _name if _path != '/' else '/' + _name\n"
+        "        _stat = None\n"
+        "        try:\n"
+        "            _stat = os.stat(_full)\n"
+        "        except:\n"
+        "            _stat = None\n"
+        "        _kind = 'D' if _is_dir(_entry, _full, _stat) else 'F'\n"
+        "        if _kind == 'F':\n"
+        "            if _stat is not None and len(_stat) > 6:\n"
+        "                _size = _stat[6]\n"
+        "            elif len(_entry) > 3 and isinstance(_entry[3], int):\n"
+        "                _size = _entry[3]\n"
+        "            else:\n"
+        "                _size = 0\n"
+        "        else:\n"
+        "            _size = 0\n"
+        "        _mtime = _stat[8] if _stat is not None and len(_stat) > 8 else 0\n"
+        "        sys.stdout.write('ENTRY:' + str(len(_full)) + ':' + _full + ':' + _kind + ':' + str(_size) + ':' + str(_mtime) + '\\n')\n"
+        "    print('LIST_DONE')\n"
+        "except Exception as _exc:\n"
+        "    _emit_err('LISTERR', _exc)\n"
+    )
+
+
+def device_delete_path_script(remote_path: str, recursive: bool) -> str:
+    remote_path_json = json.dumps(remote_path)
+    recursive_literal = "True" if recursive else "False"
+    return (
+        "import os\n"
+        f"_path = {remote_path_json}\n"
+        f"_recursive = {recursive_literal}\n"
+        "def _emit_err(_prefix, _exc):\n"
+        "    _errno = getattr(_exc, 'errno', None)\n"
+        "    if _errno is None:\n"
+        "        try:\n"
+        "            _errno = int(_exc.args[0]) if getattr(_exc, 'args', None) else None\n"
+        "        except:\n"
+        "            _errno = None\n"
+        "    print(_prefix + ':' + ('' if _errno is None else str(_errno)) + ':' + str(_exc))\n"
+        "def _join(_base, _name):\n"
+        "    return _base + '/' + _name if _base and _base != '/' else '/' + _name\n"
+        "def _is_dir(_path, _stat):\n"
+        "    try:\n"
+        "        _mode = _stat[0] if _stat and len(_stat) > 0 else 0\n"
+        "        if _mode & 0x4000:\n"
+        "            return True\n"
+        "    except:\n"
+        "        pass\n"
+        "    try:\n"
+        "        os.ilistdir(_path)\n"
+        "        return True\n"
+        "    except:\n"
+        "        return False\n"
+        "def _rmtree(_path):\n"
+        "    for _entry in os.ilistdir(_path):\n"
+        "        _name = _entry[0]\n"
+        "        _full = _join(_path, _name)\n"
+        "        _stat = None\n"
+        "        try:\n"
+        "            _stat = os.stat(_full)\n"
+        "        except:\n"
+        "            _stat = None\n"
+        "        if _is_dir(_full, _stat):\n"
+        "            _rmtree(_full)\n"
+        "            os.rmdir(_full)\n"
+        "        else:\n"
+        "            os.remove(_full)\n"
+        "try:\n"
+        "    _stat = os.stat(_path)\n"
+        "except Exception as _exc:\n"
+        "    _emit_err('DELERR', _exc)\n"
+        "else:\n"
+        "    try:\n"
+        "        if _is_dir(_path, _stat):\n"
+        "            if _recursive:\n"
+        "                _rmtree(_path)\n"
+        "            os.rmdir(_path)\n"
+        "            print('DELOK:D')\n"
+        "        else:\n"
+        "            os.remove(_path)\n"
+        "            print('DELOK:F')\n"
+        "    except Exception as _exc:\n"
+        "        _emit_err('DELERR', _exc)\n"
+    )
+
+
+def device_rename_path_script(old_path: str, new_path: str) -> str:
+    old_path_json = json.dumps(old_path)
+    new_path_json = json.dumps(new_path)
+    return (
+        "import os\n"
+        f"_old = {old_path_json}\n"
+        f"_new = {new_path_json}\n"
+        "def _emit_err(_prefix, _exc):\n"
+        "    _errno = getattr(_exc, 'errno', None)\n"
+        "    if _errno is None:\n"
+        "        try:\n"
+        "            _errno = int(_exc.args[0]) if getattr(_exc, 'args', None) else None\n"
+        "        except:\n"
+        "            _errno = None\n"
+        "    print(_prefix + ':' + ('' if _errno is None else str(_errno)) + ':' + str(_exc))\n"
+        "try:\n"
+        "    os.rename(_old, _new)\n"
+        "    print('RENAME_OK')\n"
+        "except Exception as _exc:\n"
+        "    _emit_err('RENAMEERR', _exc)\n"
+    )
+
+
 def device_put_file_script(remote_file: str, data: bytes, chunk_bytes: int) -> str:
     remote_file_json = json.dumps(remote_file)
     lines = [
@@ -439,7 +618,7 @@ def device_put_file_script(remote_file: str, data: bytes, chunk_bytes: int) -> s
         "_f.close()",
         'print("OK")',
     ])
-    return "\\r\\n".join(lines) + "\\r\\n"
+    return "\r\n".join(lines) + "\r\n"
 
 
 def estimate_sync_source_timeout(source: str, minimum_seconds: float, bytes_per_second: float = 8192.0) -> float:

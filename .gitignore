@@ -5,3 +5,11 @@ out/
 __pycache__/
 *.py[cod]
 runtime/
+FILETREE_UI.md
+check.py
+micropython_file_manager_reference.md
+MIGRATION.md
+scroll_menu.py
+test.py
+VSCodeExtensionAPIFunctions.md
+VSCodeExtensionAPIStudyNotes.md

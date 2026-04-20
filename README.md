@@ -10,7 +10,7 @@ CalSci turns Visual Studio Code into a desktop control surface for the CalSci de
 - Run the active Python file interactively through the normal REPL so `input()` and live terminal interaction work as expected.
 - Scan for the connected CalSci device and keep a single extension-owned serial session active.
 - Sync the contents of a local folder to the device workspace root.
-- Browse and open files from the device workspace view.
+- Browse, edit, save, create, rename, delete, upload, download, and mount files from the device workspace view.
 - Clear all user files from the device workspace.
 - Use the hybrid panel for helper-path display mirroring and keypad injection.
 - Flash bundled CalSci firmware images directly from VS Code.
@@ -60,8 +60,26 @@ This stages a bundled runtime under `runtime/<platform>` and then compiles the e
 - `CalSci: Open Hybrid Panel`
 - `CalSci: Flash Firmware`
 - `CalSci: Refresh Workspace`
+- `CalSci: New Workspace File`
+- `CalSci: New Workspace Folder`
+- `CalSci: Rename Workspace Entry`
+- `CalSci: Delete Workspace Entry`
+- `CalSci: Upload Into Workspace`
+- `CalSci: Download Workspace Entry`
+- `CalSci: Mount Workspace In Explorer`
 - `CalSci: Refresh Testing Folder`
 - `CalSci: Clear All Files`
+
+## Workspace
+
+The `CalSci Workspace` tree is now an editable remote workspace.
+
+- Open any remote file directly in the editor and save changes back to the device.
+- Create new files and folders from the tree context menu.
+- Rename or delete remote entries from the tree context menu.
+- Upload local files or folders into the selected remote folder.
+- Download a selected remote file or folder, or fetch the whole device workspace.
+- Use `CalSci: Mount Workspace In Explorer` to add the device root as a workspace folder backed by the `calsci:` file system.
 
 ## Settings
 

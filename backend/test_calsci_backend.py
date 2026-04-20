@@ -1,4 +1,5 @@
 import ast
+import base64
 import pathlib
 import sys
 import tempfile
@@ -1133,6 +1134,7 @@ class SyncFolderTests(unittest.TestCase):
         dummy = type("DummyController", (), {})()
         dummy._conn = FakeConn()
         dummy._write_lock = threading.Lock()
+        dummy._ensure_active = lambda: None
 
         backend.CalSciController._write_bytes(dummy, b"abcdef", flush=True)
 
@@ -1169,6 +1171,234 @@ class SyncFolderTests(unittest.TestCase):
 
             self.assertEqual(len(dummy.exec_calls), 1)
             self.assertIn('f = open("apps/main.py", "wb")', dummy.exec_calls[0])
+
+
+class WorkspaceOperationTests(unittest.TestCase):
+    def test_device_put_file_script_uses_real_newlines(self) -> None:
+        script = backend._device_put_file_script("/apps/main.py", b"print(123)\n")
+        self.assertIn("\r\n", script)
+        self.assertNotIn("\\r\\n", script)
+        self.assertIn("_f.write", script)
+
+    def test_sync_read_file_bytes_uses_safe_workspace_chunk_size(self) -> None:
+        class Dummy:
+            def __init__(self) -> None:
+                self.exec_calls: list[str] = []
+
+            def sync_exec_raw_and_read(self, code: str, timeout: float = 0.0) -> str:
+                self.exec_calls.append(code)
+                return "HEX:6869\nFILE_READ_DONE\n"
+
+            def sync_enter_friendly_repl(self) -> None:
+                raise AssertionError("friendly fallback should not be used")
+
+            def sync_exec_friendly_and_read(self, code: str, timeout: float = 0.0) -> str:
+                raise AssertionError("friendly fallback should not be used")
+
+        dummy = Dummy()
+        result = backend.CalSciController.sync_read_file_bytes(dummy, "/apps/main.py", timeout=1.0)
+
+        self.assertEqual(result, b"hi")
+        self.assertEqual(len(dummy.exec_calls), 1)
+        self.assertIn(f"_f.read({backend.WORKSPACE_READ_FILE_CHUNK_BYTES})", dummy.exec_calls[0])
+
+    def test_device_stat_path_script_uses_expected_markers(self) -> None:
+        script = backend._device_stat_path_script("/apps/main.py")
+        self.assertIn("os.stat(_path)", script)
+        self.assertIn("STAT:", script)
+        self.assertIn("STATERR", script)
+
+    def test_device_list_directory_script_uses_expected_markers(self) -> None:
+        script = backend._device_list_directory_stream_script("/apps")
+        self.assertIn("os.ilistdir(_path)", script)
+        self.assertIn("ENTRY:", script)
+        self.assertIn("LIST_DONE", script)
+        self.assertIn("LISTERR", script)
+
+    def test_device_delete_path_script_supports_recursive_delete(self) -> None:
+        script = backend._device_delete_path_script("/apps", recursive=True)
+        self.assertIn("_recursive = True", script)
+        self.assertIn("os.rmdir(_path)", script)
+        self.assertIn("DELOK:D", script)
+        self.assertIn("DELERR", script)
+
+    def test_device_rename_path_script_uses_expected_markers(self) -> None:
+        script = backend._device_rename_path_script("/apps/a.py", "/apps/b.py")
+        self.assertIn("os.rename(_old, _new)", script)
+        self.assertIn("RENAME_OK", script)
+        self.assertIn("RENAMEERR", script)
+
+    def test_parse_workspace_error_payload_maps_errno(self) -> None:
+        error = backend._parse_workspace_error_payload("2:no such file")
+        self.assertIsInstance(error, backend.WorkspaceOperationError)
+        self.assertEqual(error.code, "ENOENT")
+        self.assertEqual(str(error), "no such file")
+
+    def test_parse_device_stat_output_returns_file_metadata(self) -> None:
+        parsed = backend._parse_device_stat_output("STAT:F:42:1700:1600\n", remote_path="/apps/main.py")
+        self.assertEqual(
+            parsed,
+            {
+                "path": "/apps/main.py",
+                "kind": "file",
+                "size": 42,
+                "mtime": 1700,
+                "ctime": 1600,
+            },
+        )
+
+    def test_parse_device_list_directory_output_reads_entries(self) -> None:
+        parsed = backend._parse_device_list_directory_output(
+            "ENTRY:9:/apps/lib:D:0:10\nENTRY:13:/apps/main.py:F:42:11\nLIST_DONE\n"
+        )
+        self.assertEqual(
+            parsed,
+            [
+                {
+                    "name": "lib",
+                    "path": "/apps/lib",
+                    "kind": "directory",
+                    "size": 0,
+                    "mtime": 10,
+                    "ctime": 10,
+                },
+                {
+                    "name": "main.py",
+                    "path": "/apps/main.py",
+                    "kind": "file",
+                    "size": 42,
+                    "mtime": 11,
+                    "ctime": 11,
+                },
+            ],
+        )
+
+    def test_workspace_read_file_returns_base64_payload(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.port = "COM_TEST"
+
+            def sync_stat_path(self, remote_path: str, timeout: float = 0.0) -> dict[str, object]:
+                self.stat_call = (remote_path, timeout)
+                return {
+                    "path": remote_path,
+                    "kind": "file",
+                    "size": 5,
+                    "mtime": 0,
+                    "ctime": 0,
+                }
+
+            def sync_read_file_bytes(self, remote_path: str, timeout: float = 0.0) -> bytes:
+                self.read_call = (remote_path, timeout)
+                return b"hello"
+
+        session = backend.PersistentSession(lambda _text: None, lambda _state: None, lambda _event: None)
+        controller = FakeController()
+        session._begin_exclusive_operation = lambda: (controller, False)  # type: ignore[method-assign]
+        session._end_exclusive_operation = lambda _paused: None  # type: ignore[method-assign]
+
+        result = session.workspace_read_file(port=None, remote_path="apps/main.py")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["remotePath"], "/apps/main.py")
+        self.assertEqual(result["size"], 5)
+        self.assertEqual(result["contentBase64"], base64.b64encode(b"hello").decode("ascii"))
+        self.assertEqual(controller.stat_call[0], "/apps/main.py")
+        self.assertEqual(controller.read_call[0], "/apps/main.py")
+
+    def test_workspace_write_file_writes_bytes_after_parent_check(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.port = "COM_TEST"
+                self.put_calls: list[tuple[str, bytes]] = []
+
+            def sync_stat_path(self, remote_path: str, timeout: float = 0.0) -> dict[str, object]:
+                if remote_path == "/apps":
+                    return {"path": remote_path, "kind": "directory", "size": 0, "mtime": 0, "ctime": 0}
+                if remote_path == "/apps/main.py":
+                    raise backend.WorkspaceOperationError("missing", code="ENOENT")
+                raise AssertionError(f"unexpected stat path {remote_path}")
+
+            def sync_put_content(self, remote_path: str, data: bytes, timeout: float | None = None) -> None:
+                self.put_calls.append((remote_path, data))
+
+        session = backend.PersistentSession(lambda _text: None, lambda _state: None, lambda _event: None)
+        controller = FakeController()
+        session._begin_exclusive_operation = lambda: (controller, False)  # type: ignore[method-assign]
+        session._end_exclusive_operation = lambda _paused: None  # type: ignore[method-assign]
+
+        result = session.workspace_write_file(
+            port=None,
+            remote_path="/apps/main.py",
+            content_base64=base64.b64encode(b"print('ok')\n").decode("ascii"),
+            create=True,
+            overwrite=False,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["remotePath"], "/apps/main.py")
+        self.assertEqual(result["size"], len(b"print('ok')\n"))
+        self.assertEqual(controller.put_calls, [("/apps/main.py", b"print('ok')\n")])
+
+    def test_workspace_rename_surfaces_eexist_when_target_exists(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.port = "COM_TEST"
+
+            def sync_stat_path(self, remote_path: str, timeout: float = 0.0) -> dict[str, object]:
+                if remote_path == "/apps/a.py":
+                    return {"path": remote_path, "kind": "file", "size": 1, "mtime": 0, "ctime": 0}
+                if remote_path == "/apps":
+                    return {"path": remote_path, "kind": "directory", "size": 0, "mtime": 0, "ctime": 0}
+                if remote_path == "/apps/b.py":
+                    return {"path": remote_path, "kind": "file", "size": 1, "mtime": 0, "ctime": 0}
+                raise AssertionError(f"unexpected stat path {remote_path}")
+
+            def sync_delete_path(self, remote_path: str, recursive: bool, timeout: float = 0.0) -> str:
+                raise AssertionError("delete should not run when overwrite is false")
+
+            def sync_rename_path(self, old_path: str, new_path: str, timeout: float = 0.0) -> None:
+                raise AssertionError("rename should not run when overwrite is false")
+
+        session = backend.PersistentSession(lambda _text: None, lambda _state: None, lambda _event: None)
+        controller = FakeController()
+        session._begin_exclusive_operation = lambda: (controller, False)  # type: ignore[method-assign]
+        session._end_exclusive_operation = lambda _paused: None  # type: ignore[method-assign]
+
+        result = session.workspace_rename(
+            port=None,
+            old_path="/apps/a.py",
+            new_path="/apps/b.py",
+            overwrite=False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "EEXIST")
+        self.assertIn("Path already exists", result["error"])
+
+    def test_workspace_delete_returns_deleted_kind(self) -> None:
+        class FakeController:
+            def __init__(self) -> None:
+                self.port = "COM_TEST"
+
+            def sync_stat_path(self, remote_path: str, timeout: float = 0.0) -> dict[str, object]:
+                return {"path": remote_path, "kind": "directory", "size": 0, "mtime": 0, "ctime": 0}
+
+            def sync_delete_path(self, remote_path: str, recursive: bool, timeout: float = 0.0) -> str:
+                self.delete_call = (remote_path, recursive, timeout)
+                return "directory"
+
+        session = backend.PersistentSession(lambda _text: None, lambda _state: None, lambda _event: None)
+        controller = FakeController()
+        session._begin_exclusive_operation = lambda: (controller, False)  # type: ignore[method-assign]
+        session._end_exclusive_operation = lambda _paused: None  # type: ignore[method-assign]
+
+        result = session.workspace_delete(port=None, remote_path="/apps", recursive=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["kind"], "directory")
+        self.assertEqual(controller.delete_call[0], "/apps")
+        self.assertTrue(controller.delete_call[1])
 
 
 class FirmwareBootloaderTests(unittest.TestCase):

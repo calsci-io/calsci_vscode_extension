@@ -85,7 +85,7 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
     label: "Select Folder",
     description: "Choose a folder and sync its contents to CalSci root.",
     command: "calsci.syncFolder",
-    icon: "sync",
+    icon: "folder-opened",
   },
   {
     id: "fetchWorkspace",
@@ -96,10 +96,10 @@ const ACTIONS: readonly CalSciActionDefinition[] = [
   },
   {
     id: "fetchWorkspacePartial",
-    label: "Partial Fetch",
-    description: "Choose CalSci files or folders to download into a local folder.",
+    label: "Download Selected Files",
+    description: "Turn on workspace checkboxes, then download only the selected CalSci files or folders.",
     command: "calsci.fetchWorkspacePartial",
-    icon: "filter",
+    icon: "list-selection",
   },
   {
     id: "clearAllFiles",

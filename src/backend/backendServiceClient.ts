@@ -25,9 +25,15 @@ import {
   type TerminalWriteResult,
   type HybridSnapshotResult,
   type HybridKeyResult,
+  type WorkspaceCreateDirectoryResult,
+  type WorkspaceDeleteResult,
+  type WorkspaceDirectoryResult,
   type WorkspaceFileResult,
   type WorkspaceImportResult,
+  type WorkspaceRenameResult,
+  type WorkspaceStatResult,
   type WorkspaceTreeResult,
+  type WorkspaceWriteFileResult,
 } from "../core/shared";
 
 export class BackendServiceClient implements vscode.Disposable {
@@ -273,10 +279,75 @@ export class BackendServiceClient implements vscode.Disposable {
     return this.request<WorkspaceTreeResult>("workspace.scan-tree", { port });
   }
 
+  public async listWorkspaceDirectory(port: string, remotePath: string): Promise<WorkspaceDirectoryResult> {
+    return this.request<WorkspaceDirectoryResult>("workspace.list-directory", {
+      port,
+      remotePath,
+    });
+  }
+
+  public async statWorkspaceEntry(port: string, remotePath: string): Promise<WorkspaceStatResult> {
+    return this.request<WorkspaceStatResult>("workspace.stat", {
+      port,
+      remotePath,
+    });
+  }
+
   public async readWorkspaceFile(port: string, remotePath: string): Promise<WorkspaceFileResult> {
     return this.request<WorkspaceFileResult>("workspace.read-file", {
       port,
       remotePath,
+    });
+  }
+
+  public async writeWorkspaceFile(
+    port: string,
+    remotePath: string,
+    contentBase64: string,
+    options: {
+      create: boolean;
+      overwrite: boolean;
+    },
+  ): Promise<WorkspaceWriteFileResult> {
+    return this.request<WorkspaceWriteFileResult>("workspace.write-file", {
+      port,
+      remotePath,
+      contentBase64,
+      create: options.create,
+      overwrite: options.overwrite,
+    });
+  }
+
+  public async createWorkspaceDirectory(port: string, remotePath: string): Promise<WorkspaceCreateDirectoryResult> {
+    return this.request<WorkspaceCreateDirectoryResult>("workspace.create-directory", {
+      port,
+      remotePath,
+    });
+  }
+
+  public async deleteWorkspaceEntry(
+    port: string,
+    remotePath: string,
+    recursive: boolean,
+  ): Promise<WorkspaceDeleteResult> {
+    return this.request<WorkspaceDeleteResult>("workspace.delete", {
+      port,
+      remotePath,
+      recursive,
+    });
+  }
+
+  public async renameWorkspaceEntry(
+    port: string,
+    oldPath: string,
+    newPath: string,
+    overwrite: boolean,
+  ): Promise<WorkspaceRenameResult> {
+    return this.request<WorkspaceRenameResult>("workspace.rename", {
+      port,
+      oldPath,
+      newPath,
+      overwrite,
     });
   }
 

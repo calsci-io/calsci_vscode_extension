@@ -35,21 +35,7 @@
     "calculator"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:calsci.softResetDevice",
-    "onCommand:calsci.selectDevice",
-    "onCommand:calsci.openTerminal",
-    "onCommand:calsci.runCurrentFile",
-    "onCommand:calsci.runInteractiveFile",
-    "onCommand:calsci.syncFolder",
-    "onCommand:calsci.fetchWorkspace",
-    "onCommand:calsci.fetchWorkspacePartial",
-    "onCommand:calsci.clearAllFiles",
-    "onCommand:calsci.flashFirmware",
-    "onCommand:calsci.eraseChip",
-    "onCommand:calsci.refreshWorkspace",
-    "onCommand:calsci.refreshTestingFolder",
-    "onCommand:calsci.openHybridPanel"
+    "onStartupFinished"
   ],
   "main": "out/extension.js",
   "files": [
@@ -78,15 +64,18 @@
       "calsciSidebar": [
         {
           "id": "calsci.actionsView",
-          "name": "Actions"
+          "name": "Actions",
+          "icon": "media/calsci.svg"
         },
         {
           "id": "calsci.workspaceView",
-          "name": "CalSci Workspace"
+          "name": "CalSci Workspace",
+          "icon": "media/new-folder.svg"
         },
         {
           "id": "calsci.testingView",
-          "name": "Testing Folder"
+          "name": "Testing Folder",
+          "icon": "media/new-file.svg"
         }
       ]
     },
@@ -137,7 +126,26 @@
       },
       {
         "command": "calsci.fetchWorkspacePartial",
-        "title": "CalSci: Partial Fetch"
+        "title": "CalSci: Download Selected Files",
+        "icon": {
+          "light": "media/workspace-fetch-light.svg",
+          "dark": "media/workspace-fetch-dark.svg"
+        }
+      },
+      {
+        "command": "calsci.fetchWorkspacePartialConfirm",
+        "title": "Download Selected Now",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.fetchWorkspacePartialClear",
+        "title": "Clear Download Selection",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.fetchWorkspacePartialCancel",
+        "title": "Close Download Selection",
+        "category": "CalSci"
       },
       {
         "command": "calsci.refreshTestingFolder",
@@ -169,10 +177,72 @@
       },
       {
         "command": "calsci.refreshWorkspace",
-        "title": "CalSci: Refresh Workspace",
+        "title": "Refresh Workspace",
+        "category": "CalSci",
         "icon": {
-          "light": "media/reset.svg",
-          "dark": "media/reset.svg"
+          "light": "media/workspace-refresh-light.svg",
+          "dark": "media/workspace-refresh-dark.svg"
+        }
+      },
+      {
+        "command": "calsci.newWorkspaceFile",
+        "title": "New File",
+        "category": "CalSci",
+        "icon": {
+          "light": "media/workspace-new-file-light.svg",
+          "dark": "media/workspace-new-file-dark.svg"
+        }
+      },
+      {
+        "command": "calsci.newWorkspaceFolder",
+        "title": "New Folder",
+        "category": "CalSci",
+        "icon": {
+          "light": "media/workspace-new-folder-light.svg",
+          "dark": "media/workspace-new-folder-dark.svg"
+        }
+      },
+      {
+        "command": "calsci.copyWorkspaceEntry",
+        "title": "Copy",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.pasteWorkspaceEntry",
+        "title": "Paste",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.renameWorkspaceEntry",
+        "title": "Rename",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.deleteWorkspaceEntry",
+        "title": "Delete",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.uploadWorkspaceEntry",
+        "title": "CalSci: Upload Into Workspace"
+      },
+      {
+        "command": "calsci.downloadWorkspaceEntry",
+        "title": "Download",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.showWorkspaceEntryProperties",
+        "title": "Properties",
+        "category": "CalSci"
+      },
+      {
+        "command": "calsci.mountWorkspace",
+        "title": "Mount Workspace In Explorer",
+        "category": "CalSci",
+        "icon": {
+          "light": "media/workspace-mount-light.svg",
+          "dark": "media/workspace-mount-dark.svg"
         }
       },
       {
@@ -187,49 +257,66 @@
     "menus": {
       "view/title": [
         {
-          "command": "calsci.openHybridPanel",
-          "when": "view == calsci.actionsView",
+          "command": "calsci.newWorkspaceFile",
+          "when": "view == calsci.workspaceView",
           "group": "navigation@1"
         },
         {
-          "command": "calsci.softResetDevice",
-          "when": "view == calsci.actionsView",
+          "command": "calsci.newWorkspaceFolder",
+          "when": "view == calsci.workspaceView",
           "group": "navigation@2"
-        },
-        {
-          "command": "calsci.flashFirmware",
-          "when": "view == calsci.actionsView",
-          "group": "navigation@3"
-        },
-        {
-          "command": "calsci.eraseChip",
-          "when": "view == calsci.actionsView",
-          "group": "navigation@4"
-        },
-        {
-          "command": "calsci.runCurrentFile",
-          "when": "view == calsci.actionsView",
-          "group": "navigation@5"
-        },
-        {
-          "command": "calsci.runInteractiveFile",
-          "when": "view == calsci.actionsView",
-          "group": "navigation@6"
-        },
-        {
-          "command": "calsci.openTerminal",
-          "when": "view == calsci.actionsView",
-          "group": "navigation@7"
         },
         {
           "command": "calsci.refreshWorkspace",
           "when": "view == calsci.workspaceView",
-          "group": "navigation@1"
+          "group": "navigation@3"
+        },
+        {
+          "command": "calsci.fetchWorkspacePartial",
+          "when": "view == calsci.workspaceView",
+          "group": "navigation@4"
+        },
+        {
+          "command": "calsci.mountWorkspace",
+          "when": "view == calsci.workspaceView",
+          "group": "navigation@5"
         },
         {
           "command": "calsci.refreshTestingFolder",
           "when": "view == calsci.testingView",
           "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "calsci.renameWorkspaceEntry",
+          "when": "view == calsci.workspaceView && (viewItem == calsciWorkspaceFolder || viewItem == calsciWorkspaceFile)",
+          "group": "1_main@1"
+        },
+        {
+          "command": "calsci.deleteWorkspaceEntry",
+          "when": "view == calsci.workspaceView && (viewItem == calsciWorkspaceFolder || viewItem == calsciWorkspaceFile)",
+          "group": "1_main@2"
+        },
+        {
+          "command": "calsci.copyWorkspaceEntry",
+          "when": "view == calsci.workspaceView && (viewItem == calsciWorkspaceFolder || viewItem == calsciWorkspaceFile)",
+          "group": "2_clipboard@1"
+        },
+        {
+          "command": "calsci.downloadWorkspaceEntry",
+          "when": "view == calsci.workspaceView && (viewItem == calsciWorkspaceRoot || viewItem == calsciWorkspaceFolder || viewItem == calsciWorkspaceFile)",
+          "group": "2_clipboard@2"
+        },
+        {
+          "command": "calsci.pasteWorkspaceEntry",
+          "when": "view == calsci.workspaceView && calsci.workspaceHasClipboard && (viewItem == calsciWorkspaceRoot || viewItem == calsciWorkspaceFolder || viewItem == calsciWorkspaceFile)",
+          "group": "2_clipboard@3"
+        },
+        {
+          "command": "calsci.showWorkspaceEntryProperties",
+          "when": "view == calsci.workspaceView && (viewItem == calsciWorkspaceRoot || viewItem == calsciWorkspaceFolder || viewItem == calsciWorkspaceFile)",
+          "group": "3_info@1"
         }
       ],
       "explorer/context": [
